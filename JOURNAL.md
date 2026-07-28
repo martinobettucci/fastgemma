@@ -1459,3 +1459,59 @@ grammar-constrained*, which the target profile always is (12 tools × 4 params
 per request). Unconstrained serving keeps g256, because against a brief that
 weights tool-call exactness equally with speed, 7.6% on one phase does not buy
 a lost tool call.
+
+
+---
+
+## 23. llama.cpp, re-measured on an idle box
+
+Parked earlier at the user's instruction ("stop the benchmark against llamacpp
+until we finish all up on our side; don't say they are worse because you were
+running a full bench at the same time"). That instruction was correct: the
+original comparison was taken while a full benchmark ran on the same 4 cores.
+
+Same box, 4 threads, same bit width — Google's own QAT Q4_0 GGUF (build
+91f8c9c) against our int4 group-256. Engines alternated within the run.
+
+| | fastgemma (median of 2) | llama.cpp | |
+|---|---|---|---|
+| prefill 512 | **208.5** [199.9–217.0] | 133.6 ± 13.3 | **+56%** |
+| prefill 2048 | **192.7** [184.9–200.5] | 114.1 ± 2.7 | **+69%** |
+| decode (tg64) | 13.6 [11.6–14.5] | 14.9–16.9 | **llama.cpp +10–24%** |
+
+A reversal of the original reading, where llama.cpp led prefill at 512 (158.5
+vs our 142.9). The attention rewrite is what moved it: prefill at 512 went
+142.9 → 208.5 over this session.
+
+### Three caveats that belong next to the numbers
+
+**Decode still favours llama.cpp single-stream**, exactly as it did before. At
+batch 1 decode is pure memory bandwidth, AMX has nothing to amortise, and their
+Q4_0 kernels are extremely well tuned. Our decode advantage exists only under
+batching — 46.8 tok/s aggregate at concurrency 8 in the target profile — and
+claiming a decode win without that qualifier would be false.
+
+**This is a speed comparison and nothing else.** llama.cpp runs a
+quantisation-aware *trained* checkpoint; ours is post-training quantised from
+bf16. Those are different accuracy starting points and no behavioural
+comparison between the two engines exists. A throughput ratio does not license
+a statement about which engine is better.
+
+**Only fastgemma uses AMX**, and this box's tile-state corruption rate drifts
+between runs. That shows up directly in the spread: our pp512 varies 199.9–217.0
+(and hit 230.1/171.4 in an earlier pair, a 26% swing) against llama.cpp's
+±13.3. Engines alternate for this reason, and ranges are quoted rather than
+points.
+
+### Trap 19 — a parser bug looks exactly like the other side losing
+
+The first corrected run printed four populated fastgemma rows next to four
+empty llama.cpp rows. That reads as the competitor failing to execute. It was
+my `-o csv` column assumption not matching llama-bench's layout; the second
+attempt then read the test name instead of the throughput because `-F"|"`
+produces a leading empty field and I counted from the wrong end.
+
+Both failures produce output that is *shaped* like a result and that favours
+the side still reporting numbers — which was mine, both times. This belongs
+with the contamination traps rather than with ordinary bugs: the danger is not
+that it breaks, it is that it does not look broken.
