@@ -57,7 +57,7 @@ fn sibling_benches() -> Vec<u32> {
 /// moves it. So the primary check is now the direct one -- is another bench
 /// running at all -- with loadavg kept as a secondary signal for everything
 /// else (builds, conversions, whatever else the box is doing).
-fn check_load() -> f64 {
+fn check_load() {
     let sibs = sibling_benches();
     if !sibs.is_empty() {
         eprintln!(
@@ -81,27 +81,30 @@ fn check_load() -> f64 {
             std::process::exit(3);
         }
     }
-    one
 }
 
 /// Re-check after the run. Contention that *starts* mid-run is invisible to any
 /// check made before it, and that is precisely the case that produced a
 /// published-looking 2x error. Loud on stdout, so it lands in the same log as
 /// the numbers it invalidates rather than in a stderr stream nobody kept.
-fn verify_clean(start_load: f64) {
+///
+/// Only sibling processes are checked. A post-run **loadavg** threshold was
+/// tried first and is unfixable: this benchmark runs `threads()` busy threads,
+/// so it drives loadavg to roughly ncpu by itself, and any threshold that
+/// catches a real competitor also catches the bench measuring its own load. It
+/// fired on a perfectly clean prefix-sharing run (0.95 -> 3.76 on 4 cores) whose
+/// sibling check was silent and whose numbers were fine.
+///
+/// A guard that cries wolf is worse than no guard: the next real warning gets
+/// read as noise. The sibling scan is precise -- it names PIDs -- so it is the
+/// whole check.
+fn verify_clean() {
     let sibs = sibling_benches();
-    let end = loadavg();
-    let ncpu = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(4) as f64;
     if !sibs.is_empty() {
         println!(
             "\n*** NUMBERS ABOVE ARE SUSPECT: {} other fgm-bench process(es) appeared \
              during this run ({sibs:?}). Discard and re-measure. ***",
             sibs.len()
-        );
-    } else if end > ncpu * 0.9 && end > start_load * 1.5 {
-        println!(
-            "\n*** NUMBERS ABOVE MAY BE SUSPECT: load average rose {start_load:.2} -> {end:.2} \
-             on {ncpu:.0} cores during this run. ***"
         );
     }
 }
@@ -204,7 +207,7 @@ fn main() {
     let mode = args.get(1).map(String::as_str).unwrap_or("sweep");
     let path = args.get(2).map(String::as_str).unwrap_or("/home/user/models/g4e2b.fgm");
 
-    let start_load = check_load();
+    check_load();
     let t0 = Instant::now();
     let model = Model::open(path).expect("open model");
     let cfg = model.cfg.clone();
@@ -929,5 +932,5 @@ fn main() {
             std::process::exit(2);
         }
     }
-    verify_clean(start_load);
+    verify_clean();
 }

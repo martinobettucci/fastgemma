@@ -1188,3 +1188,49 @@ is the instrument that would have enforced it.
 **Trap 15 — a gate everything passes tells you nothing until something fails.**
 Worth stating because the temptation after a 100% result is to treat it as
 proof of quality rather than as the absence of catastrophe. It is the second.
+
+
+---
+
+## 18. Prefix sharing, measured
+
+The target profile is 8 concurrent requests carrying the same 12-tool
+declaration block, so re-prefilling it per sequence is pure waste. Prefill the
+shared span once, then copy the cache into every other sequence
+(`KvCache::fork_from`).
+
+8 sequences, 2048 shared + 6144 unique, chunk 256, g256:
+
+| | tokens | time | effective |
+|---|---|---|---|
+| no sharing | 65536 | 470.83 s | 139.2 tok/s |
+| sharing | 65536 | 395.26 s | **165.8 tok/s** |
+
+**1.19×**, from 14336 prefill tokens avoided. Breakdown: 10.97 s of shared
+prefill, **462 ms** to fork 238 MB into seven caches, 383.82 s of unique tails.
+
+Note the gap between token count and time: 21.9% of the tokens disappear but
+only 16% of the time does, because the avoided tokens are the *cheapest* — the
+shared span sits at positions 0–2048 where attention has the least history to
+scan. An estimate based on token count alone would have over-promised by a
+third. (My pre-measurement estimate said ~1.14×, which was low for the same
+reason in the other direction: it ignored that the tails also start from a
+warm cache.)
+
+**Correctness: `next-token identity after fork: 8/8`.** The fork is a copy, not
+a recomputation, so nothing about float evaluation order changes and
+bit-identity is the right check here — unlike anything that reorders
+accumulation, where it is not.
+
+### Trap 16 — my own guard cried wolf
+
+The run printed `*** NUMBERS ABOVE MAY BE SUSPECT: load average rose 0.95 ->
+3.76 on 4 cores ***`. It was wrong. The benchmark runs four busy threads, so it
+drives loadavg to roughly ncpu *by itself*; any post-run threshold that catches
+a real competitor also catches the bench measuring its own load. The sibling
+scan — which names PIDs — stayed correctly silent, and the numbers were fine.
+
+Removed rather than tuned, because there is no threshold that separates
+self-load from competitor-load with this signal. **A guard that cries wolf is
+worse than no guard**: the next real warning gets read as noise, which is
+exactly the failure the guard exists to prevent.
