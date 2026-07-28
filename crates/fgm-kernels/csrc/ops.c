@@ -644,3 +644,50 @@ void fgm_store_v_t(int8_t *vt, const int8_t *src, int n, int slot) {
   int8_t *dst = vt + (size_t)(slot >> 2) * n * 4 + (slot & 3);
   for (int j = 0; j < n; j++) dst[(size_t)j * 4] = src[j];
 }
+
+// ------------------------------------------------- head-batched Q.K^T (MQA)
+// Scores for ALL heads of one query row against one K range, loading each K
+// line once instead of once per head.
+//
+// Why this and not AMX: measured, attention runs at 3-7% of the VNNI ceiling
+// it already has, so the multiplier is not what is scarce. With one KV head
+// every K byte feeds exactly one multiply-accumulate in the head-outer loop --
+// arithmetic intensity 1 MAC/byte -- which caps attention at 33 G MAC/s from
+// DRAM and 58 from L3 regardless of instruction set. AMX raises a ceiling that
+// is not binding.
+//
+// MQA is the opening: `n_heads` query heads share ONE kv head, so a K line
+// loaded once can serve all of them. That takes intensity from 1 to n_heads
+// MACs per byte -- 8x here -- moving the L3 ceiling from 58 to ~464 G MAC/s,
+// which is 80% of VNNI peak. Only then does the multiplier become the limit.
+//
+// Crucially this changes no stored value, only loop order, so it carries zero
+// accuracy risk. After int4 KV destroyed retention (0/7) that property is
+// worth as much as the speed.
+//
+// out_scores: [n_heads, end-start] f32, one row per head.
+void fgm_qk_heads_batched(float *out_scores, const int8_t *qq, const int32_t *qsum,
+                          const float *qscale, const int8_t *kc, const float *ks,
+                          int n_heads, int head_dim, int kvd, int start, int end,
+                          int ring, int score_stride) {
+  const __m512i kbias = _mm512_set1_epi8((char)0x80);
+  const int n = end - start;
+  for (int t = start; t < end; t++) {
+    const int slot = ring ? (t % ring) : t;
+    const int8_t *kp = kc + (size_t)slot * kvd;
+    const float kscale = ks[slot];
+    // One pass over this K line serves every head.
+    for (int h = 0; h < n_heads; h++) {
+      const int8_t *qh = qq + (size_t)h * head_dim;
+      __m512i acc = _mm512_setzero_si512();
+      for (int i = 0; i < head_dim; i += 64) {
+        acc = _mm512_dpbusd_epi32(
+            acc, _mm512_xor_si512(_mm512_loadu_si512((const void *)(kp + i)), kbias),
+            _mm512_loadu_si512((const void *)(qh + i)));
+      }
+      out_scores[(size_t)h * score_stride + (t - start)] =
+          (float)(_mm512_reduce_add_epi32(acc) - 128 * qsum[h]) * qscale[h] * kscale;
+    }
+  }
+  (void)n;
+}
