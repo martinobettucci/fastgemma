@@ -8,6 +8,11 @@
 #include <math.h>
 #include <immintrin.h>
 
+// Largest head_dim in the models this engine targets (Gemma 4 full-attention
+// layers use 512; sliding layers use 256). Used for a stack-resident quantised
+// query, so it must bound every head_dim the attention kernels can be handed.
+#define FGM_MAX_HEAD_DIM 512
+
 
 // --------------------------------------------------------------------- exp
 // GCC has no _mm512_exp_ps (that is an Intel-compiler SVML intrinsic), so this
@@ -339,14 +344,89 @@ void fgm_attend_q8_heads(float *out, const float *q, const int8_t *kc, const flo
     const int kvh = h / grp;
     float *sc = scratch;
     float mx = -INFINITY;
-    for (int t = start; t < end; t++) {
-      const int8_t *kp = kc + (size_t)KVSLOT(t) * kvd + kvh * head_dim;
-      __m512 acc = _mm512_setzero_ps();
-      for (int i = 0; i < head_dim; i += 16) {
-        __m512i kv = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(kp + i)));
-        acc = _mm512_fmadd_ps(_mm512_loadu_ps(qh + i), _mm512_cvtepi32_ps(kv), acc);
+
+    // Q.K^T in int8 with AVX512-VNNI.
+    //
+    // The f32 version of this loop spent three of every four issue slots on
+    // format conversion: per 16 elements it did load + cvtepi8_epi32 +
+    // cvtepi32_ps + fmadd, so 16 MACs cost 4 uops. Measured end to end it ran
+    // at 49.6 G MAC/s, 18.5% of this box's f32 FMA peak -- and attention is
+    // 61.9% of an 8192-token prefill, so that inefficiency was the single
+    // largest cost in the engine.
+    //
+    // vpdpbusd does 64 MACs per instruction but wants (u8, i8). K is int8, so
+    // bias it into u8 with an XOR of 0x80 -- on a two's-complement byte that is
+    // exactly +128 -- and correct afterwards:
+    //
+    //     sum_i (k_i + 128) * q_i  =  sum_i k_i q_i  +  128 * sum_i q_i
+    //
+    // sum_i q_i is one scalar per (row, head), computed here while quantising
+    // q. Biasing K rather than Q is what keeps this free of any change to the
+    // KV cache: no per-position row sums to store, no second layout.
+    //
+    // Q is quantised per head. q_norm bounds its range before RoPE by
+    // construction, so a single per-head scale is well conditioned.
+    int8_t qq[FGM_MAX_HEAD_DIM];
+    float qamax = 0.0f;
+    for (int i = 0; i < head_dim; i++) {
+      float a = fabsf(qh[i]);
+      if (a > qamax) qamax = a;
+    }
+    const float qscale = qamax / 127.0f;
+    const float qinv = qamax > 0.0f ? 127.0f / qamax : 0.0f;
+    int32_t qsum = 0;
+    for (int i = 0; i < head_dim; i++) {
+      int v = (int)lrintf(qh[i] * qinv);
+      v = v > 127 ? 127 : (v < -127 ? -127 : v);
+      qq[i] = (int8_t)v;
+      qsum += v;
+    }
+    const int32_t qcorr = 128 * qsum;
+    const __m512i kbias = _mm512_set1_epi8((char)0x80);
+
+    // Four positions per iteration against four accumulators. With VNNI the
+    // dot product itself is only ~8 instructions for head_dim 512, so a
+    // per-position _mm512_reduce_add_epi32 (~10 cycles) would dominate what it
+    // reduces. Combining four accumulators with an unpack/hadd tree costs ~13
+    // ops instead of the ~28 four separate reductions would.
+    int t = start;
+    for (; t + 4 <= end; t += 4) {
+      const int8_t *k0 = kc + (size_t)KVSLOT(t) * kvd + kvh * head_dim;
+      const int8_t *k1 = kc + (size_t)KVSLOT(t + 1) * kvd + kvh * head_dim;
+      const int8_t *k2 = kc + (size_t)KVSLOT(t + 2) * kvd + kvh * head_dim;
+      const int8_t *k3 = kc + (size_t)KVSLOT(t + 3) * kvd + kvh * head_dim;
+      __m512i a0 = _mm512_setzero_si512(), a1 = _mm512_setzero_si512();
+      __m512i a2 = _mm512_setzero_si512(), a3 = _mm512_setzero_si512();
+      for (int i = 0; i < head_dim; i += 64) {
+        const __m512i qv = _mm512_loadu_si512((const void *)(qq + i));
+        a0 = _mm512_dpbusd_epi32(a0, _mm512_xor_si512(_mm512_loadu_si512((const void *)(k0 + i)), kbias), qv);
+        a1 = _mm512_dpbusd_epi32(a1, _mm512_xor_si512(_mm512_loadu_si512((const void *)(k1 + i)), kbias), qv);
+        a2 = _mm512_dpbusd_epi32(a2, _mm512_xor_si512(_mm512_loadu_si512((const void *)(k2 + i)), kbias), qv);
+        a3 = _mm512_dpbusd_epi32(a3, _mm512_xor_si512(_mm512_loadu_si512((const void *)(k3 + i)), kbias), qv);
       }
-      float s = _mm512_reduce_add_ps(acc) * ks[KVSLOT(t)];
+      __m256i b0 = _mm256_add_epi32(_mm512_castsi512_si256(a0), _mm512_extracti64x4_epi64(a0, 1));
+      __m256i b1 = _mm256_add_epi32(_mm512_castsi512_si256(a1), _mm512_extracti64x4_epi64(a1, 1));
+      __m256i b2 = _mm256_add_epi32(_mm512_castsi512_si256(a2), _mm512_extracti64x4_epi64(a2, 1));
+      __m256i b3 = _mm256_add_epi32(_mm512_castsi512_si256(a3), _mm512_extracti64x4_epi64(a3, 1));
+      __m256i d = _mm256_hadd_epi32(_mm256_hadd_epi32(b0, b1), _mm256_hadd_epi32(b2, b3));
+      __m128i e = _mm_add_epi32(_mm256_castsi256_si128(d), _mm256_extracti128_si256(d, 1));
+      int32_t raw[4];
+      _mm_storeu_si128((__m128i *)raw, e);
+      for (int j = 0; j < 4; j++) {
+        float s = (float)(raw[j] - qcorr) * qscale * ks[KVSLOT(t + j)];
+        sc[t + j - start] = s;
+        if (s > mx) mx = s;
+      }
+    }
+    for (; t < end; t++) {
+      const int8_t *kp = kc + (size_t)KVSLOT(t) * kvd + kvh * head_dim;
+      __m512i acc = _mm512_setzero_si512();
+      for (int i = 0; i < head_dim; i += 64) {
+        acc = _mm512_dpbusd_epi32(
+            acc, _mm512_xor_si512(_mm512_loadu_si512((const void *)(kp + i)), kbias),
+            _mm512_loadu_si512((const void *)(qq + i)));
+      }
+      float s = (float)(_mm512_reduce_add_epi32(acc) - qcorr) * qscale * ks[KVSLOT(t)];
       sc[t - start] = s;
       if (s > mx) mx = s;
     }
@@ -356,14 +436,14 @@ void fgm_attend_q8_heads(float *out, const float *q, const int8_t *kc, const flo
     // sum_r r * n_heads * n_full = 1.9e9 exponentials.
     const int n = end - start;
     __m512 vmx = _mm512_set1_ps(mx), vsum = _mm512_setzero_ps();
-    int t = 0;
-    for (; t + 16 <= n; t += 16) {
-      __m512 e = exp512_ps(_mm512_sub_ps(_mm512_loadu_ps(sc + t), vmx));
-      _mm512_storeu_ps(sc + t, e);
+    int u = 0;
+    for (; u + 16 <= n; u += 16) {
+      __m512 e = exp512_ps(_mm512_sub_ps(_mm512_loadu_ps(sc + u), vmx));
+      _mm512_storeu_ps(sc + u, e);
       vsum = _mm512_add_ps(vsum, e);
     }
     float sum = _mm512_reduce_add_ps(vsum);
-    for (; t < n; t++) { sc[t] = expf(sc[t] - mx); sum += sc[t]; }
+    for (; u < n; u++) { sc[u] = expf(sc[u] - mx); sum += sc[u]; }
     float inv = 1.0f / sum;
     float *oh = out + (size_t)h * head_dim;
     for (int i = 0; i < head_dim; i += 16) _mm512_storeu_ps(oh + i, _mm512_setzero_ps());
