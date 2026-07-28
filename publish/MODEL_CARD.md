@@ -202,6 +202,25 @@ huggingface-cli download P2Enjoy/fastgemma-gemma-4-E2B g4e2b-dual.fgm --local-di
 AMX tile height — below 16 rows a GEMM cannot fill one tile of rows, so it is
 decode-shaped whatever the caller calls it).
 
+## What was tried and rejected
+
+Recorded because negative results are the expensive half of this work, and
+because two of these look attractive on paper:
+
+| change | result |
+|---|---|
+| **int4 KV cache** | **Rejected.** 0/7 retention at 8k, tool calling collapses into repetition loops. Weight precision and KV precision are not interchangeable: a weight error perturbs one matmul, a KV error perturbs every future score against that position, and softmax exponentiates it. |
+| **Flash-style blocked attention** | Rejected. Loses at every context from 128 to 8192 (−1.3% to −17.3%). With 1 KV head the int8 K set is L2-resident at the contexts served, so there was no traffic to save and the online-softmax bookkeeping was pure cost. |
+| **AMX for attention** | Rejected without building. The kernel runs at 3–7% of the VNNI ceiling it already has, so instructions are not scarce — see the section above. |
+| **int4 group 512** | Conditionally accepted, +7.6% prefill. Ships only with constrained decoding. |
+
+A **head-batched** attention kernel (one K line serving all 8 query heads,
+raising intensity from 1 to 8 MACs/byte) measures **2.59× on Q·Kᵀ alone** at
+head_dim 512 / ctx 8192, with a crossover exactly on the 2 MB L2 line. It is
+integrated but **not yet verified end to end** — the benchmark host lost its
+AMX units before that could be measured, so it is not reflected in any number
+on this card.
+
 ## Known limitations
 
 - **AMX required.** No AVX-512-only or ARM fallback.
