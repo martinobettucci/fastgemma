@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use crate::kv::KvCache;
 use crate::model::{Config, Model, QLinear};
-use crate::pool::{AttnJob, GemmJob, Pool, RowRef};
+use crate::pool::{AttnJob, FaRow, GemmJob, Pool, PrepJob, RowRef};
 use fgm_kernels as k;
 
 /// Weights for one decoder layer, resolved once at construction.
@@ -63,18 +63,19 @@ impl Gemm {
     /// `out[m, 0..w.n) = w . a[m, 0..w.k)`: rotate, quantise, tile-pack, dispatch.
     fn run(&mut self, pool: &Pool, w: &QLinear, a: &[f32], m: usize, lda: usize, out: &mut [f32]) {
         let (kk, n) = (w.k, w.n);
-        if lda == kk {
-            self.rot[..m * kk].copy_from_slice(&a[..m * kk]);
-        } else {
-            for r in 0..m {
-                self.rot[r * kk..(r + 1) * kk].copy_from_slice(&a[r * lda..r * lda + kk]);
-            }
-        }
-        if w.hadamard > 0 {
-            k::fwht(&mut self.rot[..m * kk], w.hadamard);
-        }
-        k::quant_act(&self.rot[..m * kk], m, kk, &mut self.qa, &mut self.qs);
-        k::pack_a(m, kk, &self.qa, &mut self.pa);
+        // Rotate + quantise + tile-pack, parallel over 16-row tile blocks. This
+        // used to run single-threaded while the GEMM below it did not.
+        pool.prep(PrepJob {
+            src: a.as_ptr(),
+            lda,
+            rot: self.rot.as_mut_ptr(),
+            qa: self.qa.as_mut_ptr(),
+            qs: self.qs.as_mut_ptr(),
+            pa: self.pa.as_mut_ptr(),
+            m,
+            k: kk,
+            hsz: w.hadamard,
+        });
         pool.gemm(GemmJob {
             m,
             n,
@@ -130,6 +131,10 @@ pub struct Runner<'m> {
     dump: Vec<f32>,
     /// Per-row KV view, rebuilt each layer (cheap: m entries).
     rows: Vec<RowRef>,
+    /// same rows in the blocked kernel's C layout
+    fa: Vec<FaRow>,
+    /// FGM_NO_BLOCKED_ATTN=1 forces the per-(row, head) path, for A/B testing
+    no_blocked: bool,
     /// Per-phase seconds, accumulated when FGM_PROFILE is set.
     pub prof: [f64; NPHASE],
     profiling: bool,
@@ -252,7 +257,10 @@ impl<'m> Runner<'m> {
                 tmp: vec![0.0; hs.max(kmax)],
                 logits: vec![0.0; max_logit_rows * cfg.vocab_size],
             },
-            pool: Pool::new(threads, max_ctx + 64),
+            pool: Pool::new(
+                threads,
+                (max_ctx + 64).max(k::blocked_scratch(nh, hdmax, kvh)),
+            ),
             layers,
             model,
             cfg,
@@ -265,6 +273,15 @@ impl<'m> Runner<'m> {
                 };
                 m
             ],
+            fa: vec![
+                FaRow {
+                    kc: std::ptr::null(), vc: std::ptr::null(),
+                    ks: std::ptr::null(), vs: std::ptr::null(),
+                    k_len: 0, pos: 0,
+                };
+                m
+            ],
+            no_blocked: std::env::var_os("FGM_NO_BLOCKED_ATTN").is_some(),
             prof: [0.0; NPHASE],
             profiling: std::env::var_os("FGM_PROFILE").is_some(),
         }
@@ -434,6 +451,7 @@ impl<'m> Runner<'m> {
                     "ring cache holds {} but a batch of {m} rows with window {} needs {}",
                     lk.capacity, cfg.sliding_window, m + cfg.sliding_window
                 );
+                let ring = if lk.ring { lk.capacity } else { 0 };
                 self.rows[r] = RowRef {
                     kc: lk.k.as_ptr(),
                     ks: lk.ks.as_ptr(),
@@ -441,18 +459,38 @@ impl<'m> Runner<'m> {
                     vs: lk.vs.as_ptr(),
                     k_len: lk.capacity,
                     pos: pos[r],
-                    ring: if lk.ring { lk.capacity } else { 0 },
+                    ring,
+                };
+                self.fa[r] = FaRow {
+                    kc: lk.k.as_ptr(),
+                    vc: lk.v.as_ptr(),
+                    ks: lk.ks.as_ptr(),
+                    vs: lk.vs.as_ptr(),
+                    k_len: ring as i32,
+                    pos: pos[r] as i32,
                 };
             }
+            // Blocking only pays when there are enough query rows to amortise a
+            // K/V block; at m=1 (decode) the KV range is read once anyway and
+            // row-splitting would leave threads idle, so keep the per-head path.
+            //
+            // It is also only *correct* when every row in a block reads the same
+            // cache, because the block's K is dequantised once and shared. That
+            // holds for chunked prefill (one sequence at a time) but not for
+            // batched decode, where each row is a different sequence.
+            let same_cache = seq[..m].iter().all(|&x| x == seq[0]);
+            let blocked = m >= 16 && same_cache && !self.no_blocked;
             self.pool.attn(AttnJob {
                 out: b.ao.as_mut_ptr(),
                 q: b.q.as_ptr(),
                 rows: self.rows.as_ptr(),
+                fa: self.fa.as_ptr(),
                 nh,
                 kvh,
                 hd,
                 m,
                 window: if w.sliding { cfg.sliding_window } else { 0 },
+                blocked,
             });
 
             tock!(_t, prof, 5);

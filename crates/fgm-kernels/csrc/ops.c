@@ -33,6 +33,9 @@ static inline __m512 exp512_ps(__m512 x) {
   return _mm512_mul_ps(y, p2);
 }
 
+void fgm_fwht(float *, int, int);
+void fgm_quant_act(const float *, int, int, int8_t *, float *);
+
 // ------------------------------------------------------------------ RMSNorm
 // Gemma 4: normed = x * (mean(x^2) + eps)^-0.5, then * weight (NOT 1 + weight,
 // unlike Gemma 2/3). Accumulated in f32, matching the reference which upcasts.
@@ -221,6 +224,47 @@ void fgm_gather_q4r(float *out, const uint8_t *tbl, const _Float16 *sc, int row,
   }
 }
 
+
+// ------------------------------------------------- GEMM activation preamble
+// Every GEMM must rotate (rotconv FWHT), quantise to int8 and tile-pack its
+// activation before the AMX kernel can touch it. That work was single-threaded
+// while the GEMM itself was not, which is why a standalone GEMM benches far
+// above what the same shape delivers inside the forward pass.
+//
+// Split by whole 16-row tile blocks so every stage stays aligned: the FWHT
+// operates on row-contiguous blocks of `hsz`, quantisation is per row, and
+// pack_a's unit is exactly a 16-row tile.
+//
+//   src  [m, lda] f32   activation, rows may be strided
+//   rot  [m, k]   f32   scratch for the rotated copy
+//   qa   [m, k]   i8    quantised
+//   qs   [m]      f32   per-row scales
+//   pa            i8    tile-packed output for the AMX kernel
+//
+// r0/r1 are row bounds; r0 must be a multiple of 16.
+void fgm_prep_rows(const float *src, int lda, float *rot, int8_t *qa, float *qs,
+                   int8_t *pa, int m, int k, int hsz, int r0, int r1) {
+  if (r0 >= r1) return;
+  const int n = r1 - r0;
+  for (int r = r0; r < r1; r++)
+    memcpy(rot + (size_t)r * k, src + (size_t)r * lda, (size_t)k * sizeof(float));
+  if (hsz > 0) fgm_fwht(rot + (size_t)r0 * k, n * k, hsz);
+  fgm_quant_act(rot + (size_t)r0 * k, n, k, qa + (size_t)r0 * k, qs + r0);
+
+  // pack_a for this row range only: tile blocks [r0/16, ceil(r1/16))
+  const int KB = k / 64;
+  for (int mb = r0 / 16; mb * 16 < r1; mb++) {
+    for (int kb = 0; kb < KB; kb++) {
+      int8_t *d = pa + ((size_t)mb * KB + kb) * 1024;
+      for (int rr = 0; rr < 16; rr++) {
+        int row = mb * 16 + rr;
+        if (row < m) memcpy(d + rr * 64, qa + (size_t)row * k + kb * 64, 64);
+        else memset(d + rr * 64, 0, 64);
+      }
+    }
+  }
+}
+
 // -------------------------------------------------------------- elementwise
 void fgm_add(float *a, const float *b, int n) {
   int i = 0;
@@ -324,6 +368,148 @@ void fgm_attend_q8_heads(float *out, const float *q, const int8_t *kc, const flo
     }
   }
 #undef KVSLOT
+}
+
+
+// --------------------------------------------------- blocked (flash) attention
+// The per-(query, head) loop above re-streams the whole KV range for every
+// query row AND every head. For an 8192-token prefill that is
+//
+//     sum_r r * 2 * head_dim * n_heads * n_layers  ~= 1.9 TB
+//
+// on the full-attention layers alone -- 58 s at this box's 33 GB/s, against a
+// measured 90 s total prefill. The fix is not AMX and not bf16, it is blocking:
+// process Br query positions across ALL heads against one K/V block, so each
+// cache line is read once per (query block, key block) rather than once per
+// (query row, head). That is a Br * n_heads = 64x reduction.
+//
+// Softmax is online (running max and denominator), so no score matrix is ever
+// materialised and the K/V block can stay resident while every query row in the
+// block consumes it.
+//
+// Gemma 4 is MQA (1 KV head), so all query heads share the same K/V rows --
+// which is exactly what makes the head dimension free to fold into the block.
+//
+//   q    [m, n_heads, head_dim] f32
+//   out  [m, n_heads, head_dim] f32
+//   rows[i] gives each query row its cache, position and ring capacity
+//
+// PRECONDITION: every row in [r0, r1) must reference the SAME cache, because a
+// K block is dequantised once and shared across the whole query block. True for
+// chunked prefill (one sequence at a time); false for batched decode, where the
+// caller must use the per-(row, head) path instead.
+#define FA_BR 8      /* query positions per block */
+#define FA_BC 64     /* key positions per block; 64*512*4 = 128 KB of
+                        dequantised K, comfortably L2-resident */
+
+typedef struct {
+  const int8_t *kc, *vc;
+  const float *ks, *vs;
+  int k_len;      /* ring capacity, or 0 for a linear cache */
+  int pos;
+} fa_row_t;
+
+void fgm_attend_blocked(float *out, const float *q, const fa_row_t *rows, int m,
+                        int n_heads, int kv_heads, int head_dim, int window,
+                        int r0, int r1, float *scratch) {
+  const int kvd = kv_heads * head_dim;
+  const int grp = n_heads / kv_heads;
+  const int HD = head_dim;
+  // per (row, head): running max, running denominator
+  float *rmax = scratch;                       /* FA_BR * n_heads */
+  float *rsum = rmax + FA_BR * 32;
+  float *acc = rsum + FA_BR * 32;              /* FA_BR * n_heads * HD */
+  float *kbuf = acc + FA_BR * 32 * HD;         /* FA_BC * HD dequantised */
+
+  for (int qb = r0; qb < r1; qb += FA_BR) {
+    const int br = (qb + FA_BR <= r1) ? FA_BR : (r1 - qb);
+    // union of the windows this query block needs
+    int lo = rows[qb].pos, hi = rows[qb + br - 1].pos + 1;
+    if (window > 0) {
+      int w0 = rows[qb].pos - (window - 1);
+      lo = w0 > 0 ? w0 : 0;
+    } else {
+      lo = 0;
+    }
+    for (int i = 0; i < br * n_heads; i++) { rmax[i] = -INFINITY; rsum[i] = 0.0f; }
+    for (int i = 0; i < br * n_heads * HD; i++) acc[i] = 0.0f;
+
+    const fa_row_t *rr = &rows[qb];
+    for (int kb = lo; kb < hi; kb += FA_BC) {
+      const int bc = (kb + FA_BC <= hi) ? FA_BC : (hi - kb);
+      // dequantise the K block once for the whole query block
+      for (int t = 0; t < bc; t++) {
+        int slot = rr->k_len ? ((kb + t) % rr->k_len) : (kb + t);
+        const int8_t *kp = rr->kc + (size_t)slot * kvd;
+        float sc = rr->ks[slot];
+        __m512 vsc = _mm512_set1_ps(sc);
+        for (int i = 0; i < kvd; i += 16) {
+          __m512i v = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(kp + i)));
+          _mm512_storeu_ps(kbuf + (size_t)t * kvd + i,
+                           _mm512_mul_ps(_mm512_cvtepi32_ps(v), vsc));
+        }
+      }
+
+      for (int r = 0; r < br; r++) {
+        const int pos = rows[qb + r].pos;
+        const int lo_r = (window > 0 && pos >= window) ? pos - (window - 1) : 0;
+        for (int h = 0; h < n_heads; h++) {
+          const float *qh = q + ((size_t)(qb + r) * n_heads + h) * HD;
+          const int kvh = h / grp;
+          float *a = acc + ((size_t)r * n_heads + h) * HD;
+          float mx = rmax[r * n_heads + h], sm = rsum[r * n_heads + h];
+
+          for (int t = 0; t < bc; t++) {
+            const int p = kb + t;
+            if (p > pos || p < lo_r) continue;           /* causal + window */
+            const float *kp = kbuf + (size_t)t * kvd + kvh * HD;
+            __m512 dot = _mm512_setzero_ps();
+            for (int i = 0; i < HD; i += 16)
+              dot = _mm512_fmadd_ps(_mm512_loadu_ps(qh + i), _mm512_loadu_ps(kp + i), dot);
+            float sc = _mm512_reduce_add_ps(dot);
+
+            if (sc > mx) {                                /* rescale to new max */
+              const float f = expf(mx - sc);
+              if (sm != 0.0f) {
+                __m512 vf = _mm512_set1_ps(f);
+                for (int i = 0; i < HD; i += 16)
+                  _mm512_storeu_ps(a + i, _mm512_mul_ps(_mm512_loadu_ps(a + i), vf));
+              }
+              sm *= f;
+              mx = sc;
+            }
+            const float w = expf(sc - mx);
+            sm += w;
+            int slot = rr->k_len ? (p % rr->k_len) : p;
+            const int8_t *vp = rr->vc + (size_t)slot * kvd + kvh * HD;
+            __m512 vw = _mm512_set1_ps(w * rr->vs[slot]);
+            for (int i = 0; i < HD; i += 16) {
+              __m512i vv = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(vp + i)));
+              _mm512_storeu_ps(a + i,
+                  _mm512_fmadd_ps(_mm512_cvtepi32_ps(vv), vw, _mm512_loadu_ps(a + i)));
+            }
+          }
+          rmax[r * n_heads + h] = mx;
+          rsum[r * n_heads + h] = sm;
+        }
+      }
+    }
+
+    for (int r = 0; r < br; r++)
+      for (int h = 0; h < n_heads; h++) {
+        const float inv = 1.0f / rsum[r * n_heads + h];
+        const float *a = acc + ((size_t)r * n_heads + h) * HD;
+        float *o = out + ((size_t)(qb + r) * n_heads + h) * HD;
+        __m512 vi = _mm512_set1_ps(inv);
+        for (int i = 0; i < HD; i += 16)
+          _mm512_storeu_ps(o + i, _mm512_mul_ps(_mm512_loadu_ps(a + i), vi));
+      }
+  }
+}
+
+// Scratch floats needed by fgm_attend_blocked.
+int fgm_attend_blocked_scratch(int n_heads, int head_dim, int kv_heads) {
+  return FA_BR * 32 * 2 + FA_BR * 32 * head_dim + FA_BC * kv_heads * head_dim + 64;
 }
 
 // Quantise one KV row (kv_heads*head_dim f32) to int8 with a single scale.

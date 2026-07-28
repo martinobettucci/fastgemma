@@ -10,6 +10,28 @@ use fgm_core::forward::{NPHASE, PHASE_NAMES};
 use fgm_core::{KvCache, Model, Runner};
 use std::time::Instant;
 
+/// Refuse to benchmark on a loaded machine.
+///
+/// Contention has silently corrupted measurements three times in this project:
+/// a concurrent conversion made prefill read 15% low, a concurrent build made it
+/// read ~40% low, and stray benchmark processes from a timed-out loop made a
+/// change look like a regression when it was not. Loadavg is cheap to check and
+/// the failure mode is expensive, so check it.
+fn check_load() {
+    let la = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    let one: f64 = la.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+    let ncpu = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(4) as f64;
+    if one > ncpu * 0.35 {
+        eprintln!(
+            "\n*** WARNING: load average {one:.2} on {ncpu:.0} cores before starting. \
+             Numbers from this run are NOT trustworthy. Set FGM_IGNORE_LOAD=1 to proceed anyway. ***\n"
+        );
+        if std::env::var_os("FGM_IGNORE_LOAD").is_none() {
+            std::process::exit(3);
+        }
+    }
+}
+
 fn threads() -> usize {
     std::env::var("FGM_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
 }
@@ -40,6 +62,7 @@ fn main() {
     let mode = args.get(1).map(String::as_str).unwrap_or("sweep");
     let path = args.get(2).map(String::as_str).unwrap_or("/home/user/models/g4e2b.fgm");
 
+    check_load();
     let t0 = Instant::now();
     let model = Model::open(path).expect("open model");
     let cfg = model.cfg.clone();

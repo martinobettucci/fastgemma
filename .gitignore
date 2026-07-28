@@ -75,3 +75,4 @@ bench/kernels/gemm_bench
 bench/kernels/dbg
 *.fgm
 __pycache__/
+target/

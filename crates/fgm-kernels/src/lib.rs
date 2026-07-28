@@ -9,6 +9,19 @@ use std::sync::Once;
 #[allow(non_camel_case_types)]
 pub type f16 = u16;
 
+/// Mirrors `fa_row_t` in ops.c — field order and types must match exactly.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FaRow {
+    pub kc: *const i8,
+    pub vc: *const i8,
+    pub ks: *const f32,
+    pub vs: *const f32,
+    /// ring capacity, or 0 for a linear cache
+    pub k_len: i32,
+    pub pos: i32,
+}
+
 extern "C" {
     fn fgm_amx_init() -> i32;
     fn fgm_tile_probe(trials: i32, sleep_us: i64) -> i32;
@@ -16,6 +29,10 @@ extern "C" {
     fn fgm_tile_retry_count() -> i64;
     fn fgm_tile_retry_reset();
     fn fgm_pack_a(m: i32, k: i32, a: *const i8, ap: *mut i8);
+    fn fgm_prep_rows(
+        src: *const f32, lda: i32, rot: *mut f32, qa: *mut i8, qs: *mut f32,
+        pa: *mut i8, m: i32, k: i32, hsz: i32, r0: i32, r1: i32,
+    );
     fn fgm_gemm_q4g(
         m: i32, n: i32, k: i32, a: *const i8, a_scale: *const f32,
         bq: *const u8, b_scale: *const f16, group: i32,
@@ -45,6 +62,12 @@ extern "C" {
         vc: *const i8, vs: *const f32, n_heads: i32, kv_heads: i32,
         head_dim: i32, start: i32, end: i32, scratch: *mut f32,
     );
+    fn fgm_attend_blocked(
+        out: *mut f32, q: *const f32, rows: *const FaRow, m: i32,
+        n_heads: i32, kv_heads: i32, head_dim: i32, window: i32,
+        r0: i32, r1: i32, scratch: *mut f32,
+    );
+    fn fgm_attend_blocked_scratch(n_heads: i32, head_dim: i32, kv_heads: i32) -> i32;
     fn fgm_attend_q8_heads(
         out: *mut f32, q: *const f32, kc: *const i8, ks: *const f32,
         vc: *const i8, vs: *const f32, n_heads: i32, kv_heads: i32,
@@ -298,4 +321,53 @@ pub fn tile_guard_autodetect(trials: usize) -> (bool, usize, i64) {
     }
     tile_guard_set(false);
     (false, 0, 0)
+}
+
+/// Rotate + quantise + tile-pack rows `[r0, r1)` of a GEMM activation.
+///
+/// `r0` must be a multiple of 16 so every stage stays tile-aligned. This is the
+/// per-GEMM preamble that used to run single-threaded while the GEMM itself was
+/// parallel; the pool now splits it by 16-row tile blocks.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn prep_rows(
+    src: &[f32], lda: usize, rot: &mut [f32], qa: &mut [i8], qs: &mut [f32],
+    pa: &mut [i8], m: usize, k: usize, hsz: usize, r0: usize, r1: usize,
+) {
+    debug_assert!(r0 % 16 == 0, "prep row start must be tile-aligned");
+    unsafe {
+        fgm_prep_rows(
+            src.as_ptr(), lda as i32, rot.as_mut_ptr(), qa.as_mut_ptr(),
+            qs.as_mut_ptr(), pa.as_mut_ptr(), m as i32, k as i32, hsz as i32,
+            r0 as i32, r1 as i32,
+        )
+    }
+}
+
+/// Blocked ("flash"-style) attention over query rows `[r0, r1)`.
+///
+/// Processes FA_BR query positions across *all* heads against one K/V block, so
+/// each cache line is read once per (query block, key block) instead of once per
+/// (query row, head). At an 8192-token prefill that is a ~64x cut in KV traffic,
+/// which measurement says is the dominant cost of long-context prefill.
+/// Softmax is online, so no score matrix is materialised.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn attend_blocked(
+    out: &mut [f32], q: &[f32], rows: &[FaRow], m: usize, n_heads: usize,
+    kv_heads: usize, head_dim: usize, window: usize, r0: usize, r1: usize,
+    scratch: &mut [f32],
+) {
+    debug_assert!(scratch.len() >= blocked_scratch(n_heads, head_dim, kv_heads));
+    unsafe {
+        fgm_attend_blocked(
+            out.as_mut_ptr(), q.as_ptr(), rows.as_ptr(), m as i32,
+            n_heads as i32, kv_heads as i32, head_dim as i32, window as i32,
+            r0 as i32, r1 as i32, scratch.as_mut_ptr(),
+        )
+    }
+}
+
+pub fn blocked_scratch(n_heads: usize, head_dim: usize, kv_heads: usize) -> usize {
+    unsafe { fgm_attend_blocked_scratch(n_heads as i32, head_dim as i32, kv_heads as i32) as usize }
 }
