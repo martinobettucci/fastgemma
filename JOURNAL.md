@@ -1638,3 +1638,62 @@ channels saturate, which is what actually accelerates the bandwidth-bound 46%
 of prefill that attention occupies at 8192. So a bigger single-socket machine
 helps twice — more compute for the GEMMs, more bandwidth for attention — with
 no code change beyond the thread default now fixed.
+
+
+---
+
+## 26. int4 KV cache: rejected, and weight precision is not KV precision
+
+The attention ceiling probe (§19) says attention is bandwidth-bound at 1 MAC
+per byte, so halving KV bytes is the largest lever available. Before building
+it — nibble packing, an unpack before every `vpdpbusd`, group scales along
+head_dim, both read and write paths for K and V — `FGM_KV4=1` collapses the
+existing int8 cache onto 15 levels. Same layout, same fast paths, **no fewer
+bytes moved**: it measures only the accuracy cost.
+
+**Tool calling: multiple total failures.** Empty outputs, and one case
+degenerating into a repetition loop that hallucinated a wrong year:
+
+    want create_event{title: 'Design review', date: '2026-09-14', ...}
+    got  "I will use the tool to schedule a reminder for 2024, and I will use
+          the tool to schedule a reminder for 2024, and I will use a reminder
+          for 2024, and I will use a reminder for 2024, ..."
+
+**Retention: 0/7.** Every depth. The model no longer recalls anything and
+simply echoes the filler text back:
+
+| depth | answer |
+|---|---|
+| 0.02 | `**The lights are $\text{4471, and the floors are swept...` |
+| 0.35 | `**The lights, and the floors are swept before the evening shift` |
+| 0.98 | `**The lights hum, and the floors are swept before the evening...` |
+
+Note depth 0.02 leaking a fragment of `XJ-4471` — the information is faintly
+present and no longer usable.
+
+### The finding worth keeping
+
+**Weight quantisation and KV quantisation are not interchangeable.** int4
+weights at relative error 0.10 cost nothing measurable; int4 KV destroys the
+model. Two reasons, and both are structural rather than incidental:
+
+1. **A weight error perturbs one matmul. A KV error perturbs every future
+   score against that position.** The cache is read on every subsequent step,
+   so its error is paid repeatedly and accumulates along the context.
+2. **Softmax exponentiates score error.** The weight path ends in a linear
+   accumulation; the attention path ends in `exp()`. An error that is harmless
+   linearly is not harmless after exponentiation — which is exactly why the
+   attention error harness sweeps query magnitude (§14).
+
+So the byte-reduction lever is **not** quantisation. It is **head-batching**:
+with MQA the 8 query heads share one KV head, so loading K once per position
+and serving all heads gives 8 MACs per byte instead of 1 — the same traffic
+win, at **zero accuracy cost, because it changes no stored value**. Only the
+loop order changes. After this result, that property is worth a great deal.
+
+**Trap 20 — the cheap probe earns its keep by failing.** This cost one build
+and one eval run. The implementation it avoided is a day of nibble packing and
+unpack kernels for a cache whose answers are unusable. The prior was right
+(g512's +3.9% weight error already cost a tool call, so a far coarser KV would
+be worse) but the *magnitude* was not: I expected degradation, not collapse.
+Priors are good for ordering experiments and bad for skipping them.
