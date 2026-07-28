@@ -101,19 +101,26 @@ static inline int32_t row_sum(const int8_t *p, int nb64, size_t stride) {
 // Canonical layout: within a 64-byte block, packed[i] (i<32) holds value i in
 // the low nibble and value i+32 in the high nibble.
 //
-// The AMX path sign-extends the nibble to int8; here the same step also has to
-// add the +128 VNNI bias, and (nibble - 8) + 128 == nibble + 120 folds both
-// into a single add. Two ops per half instead of four.
+// The nibble is TWO'S-COMPLEMENT 4-bit, not offset-by-8: amx_gemm.c's unpack64
+// sign-extends with (v ^ 8) - 8, so 0..7 stay positive and 8..15 become -8..-1.
+// Writing it as the Q4_0 offset convention (v - 8) instead costs nothing on
+// half the values and flips the other half by 16, which is exactly the bug
+// that shipped here first -- and it survived the unit test because the test's
+// own reference made the same assumption. Adding the +128 VNNI bias folds into
+// the same expression: ((v ^ 8) - 8) + 128 == (v ^ 8) + 120.
 //
 // The result is returned in a register rather than written to a scratch tile
 // the way the AMX path must: _tile_loadd only reads memory, but vpdpbusd takes
 // a register, so the round trip -- and the store-to-load stall behind it --
 // simply does not exist here.
 static inline __m512i unpack64_u8(const uint8_t *src) {
-  const __m256i m4 = _mm256_set1_epi8(0x0F), k120 = _mm256_set1_epi8(120);
+  const __m256i m4 = _mm256_set1_epi8(0x0F), k8 = _mm256_set1_epi8(8),
+                k120 = _mm256_set1_epi8(120);
   __m256i p = _mm256_loadu_si256((const __m256i *)src);
-  __m256i lo = _mm256_add_epi8(_mm256_and_si256(p, m4), k120);
-  __m256i hi = _mm256_add_epi8(_mm256_and_si256(_mm256_srli_epi16(p, 4), m4), k120);
+  __m256i lo = _mm256_add_epi8(
+      _mm256_xor_si256(_mm256_and_si256(p, m4), k8), k120);
+  __m256i hi = _mm256_add_epi8(
+      _mm256_xor_si256(_mm256_and_si256(_mm256_srli_epi16(p, 4), m4), k8), k120);
   return _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1);
 }
 

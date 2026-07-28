@@ -49,6 +49,25 @@ static double now(void) {
 // tile order: B[k][n] lives at tile(nb,kb)[ (k%64)/4 * 64 + (n%16)*4 + k%4 ]
 static inline int bpos(int k, int n) { return (k % 64) / 4 * 64 + (n % 16) * 4 + k % 4; }
 
+// A stored nibble is TWO'S-COMPLEMENT 4-bit: 0..7 positive, 8..15 negative.
+//
+// The first version of this file wrote `v - 8` -- the Q4_0 offset convention --
+// in BOTH the kernel and this reference, so every int4 case reported a
+// bit-identical match while the engine generated pure noise. A reference that
+// shares an assumption with the thing it checks is not a reference. Hence
+// nibble_convention_is_twos_complement() below, which pins the mapping to
+// literals taken from amx_gemm.c's unpack64 rather than to a formula.
+static inline int nib(int v) { return (v ^ 8) - 8; }
+
+static void nibble_convention_is_twos_complement(void) {
+  static const int want[16] = {0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1};
+  for (int v = 0; v < 16; v++)
+    if (nib(v) != want[v]) {
+      printf("  nibble convention wrong at %d: %d != %d\n", v, nib(v), want[v]);
+      exit(1);
+    }
+}
+
 // ------------------------------------------------------------------ int8 ref
 static void ref_q8c(int M, int N, int K, const int8_t *A, const float *as,
                     const int8_t *B, const float *bs, float *C, int ldc,
@@ -88,7 +107,7 @@ static void ref_q4g(int M, int N, int K, const int8_t *A, const float *as,
             // canonical half-split, per 64-byte block: unpacked value o of block
             // `row` is nibble (o<32 ? low : high) of packed byte row*32 + o%32
             int byte = tile[row * 32 + o % 32], v = (o < 32) ? (byte & 0xF) : (byte >> 4);
-            acc += (long)A[(size_t)m * K + k] * (v - 8);
+            acc += (long)A[(size_t)m * K + k] * nib(v);
           }
           sum = fmaf((float)acc, _cvtsh_ss(bs[(size_t)g * N + n]), sum);
         }
@@ -245,6 +264,7 @@ int main(int argc, char **argv) {
   printf("cpu: amx=%d avx512_vnni=%d\n", fgm_cpu_has_amx(), fgm_cpu_has_avx512_vnni());
   if (!fgm_cpu_has_avx512_vnni()) { printf("no VNNI on this host\n"); return 77; }
 
+  nibble_convention_is_twos_complement();
   printf("\ncorrectness\n");
   // shapes that exercise every tail: M below/at/above a 16-row block, the
   // 8-row instantiation, partial n ranges, and both group sizes
