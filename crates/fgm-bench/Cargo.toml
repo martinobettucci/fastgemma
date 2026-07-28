@@ -1,0 +1,8 @@
+[package]
+name = "fgm-bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fgm-core = { path = "../fgm-core" }
+fgm-kernels = { path = "../fgm-kernels" }
