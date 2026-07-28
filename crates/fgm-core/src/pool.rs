@@ -60,6 +60,8 @@ pub struct AttnJob {
     pub m: usize,
     /// sliding window, or 0 for full attention
     pub window: usize,
+    /// use the head-batched path (one thread per row, all heads together)
+    pub rowbatch: bool,
 }
 
 /// Rotate + quantise + tile-pack a GEMM activation, split by 16-row tile blocks.
@@ -168,6 +170,35 @@ fn run_attn(j: &AttnJob, i0: usize, i1: usize, scratch: &mut [f32]) {
             let q = std::slice::from_raw_parts(j.q.add((r * nh + h) * hd), hd);
             k::attend_q8_heads(out, q, kc, ks, vc, vs, nh, j.kvh, hd, st, en,
                                scratch, 0, 1, rr.ring, rr.k_len);
+
+        }
+    }
+}
+
+/// Head-batched attention: one thread owns ALL heads of a row, which is what
+/// lets a K line loaded once serve every head. Split is therefore by row, not
+/// by (row, head) -- 256 units at a prefill chunk, which is ample, and 1 unit
+/// at decode, which is why the shape rule keeps decode on the per-head path.
+fn run_attn_rows(j: &AttnJob, r0: usize, r1: usize, scratch: &mut [f32]) {
+    let (nh, hd) = (j.nh, j.hd);
+    let kvd = j.kvh * hd;
+    unsafe {
+        let rows = std::slice::from_raw_parts(j.rows, j.m);
+        for r in r0..r1 {
+            let rr = &rows[r];
+            let (st, en) = if j.window > 0 {
+                (rr.pos.saturating_sub(j.window - 1), rr.pos + 1)
+            } else {
+                (0, rr.pos + 1)
+            };
+            let kc = std::slice::from_raw_parts(rr.kc, rr.k_len * kvd);
+            let ks = std::slice::from_raw_parts(rr.ks, rr.k_len);
+            let vc = std::slice::from_raw_parts(rr.vc, rr.k_len.div_ceil(4) * 4 * kvd);
+            let vs = std::slice::from_raw_parts(rr.vs, rr.k_len);
+            let out = std::slice::from_raw_parts_mut(j.out.add(r * nh * hd), nh * hd);
+            let q = std::slice::from_raw_parts(j.q.add(r * nh * hd), nh * hd);
+            k::attend_q8_row(out, q, kc, ks, vc, vs, nh, j.kvh, hd, st, en,
+                             scratch, rr.ring, rr.k_len);
         }
     }
 }
@@ -219,7 +250,10 @@ impl Pool {
                             run_gemm(&g, a, b);
                         }
                         Job::Attn(at) => {
-                            {
+                            if at.rowbatch {
+                                let (a, b) = split_n(at.m, nt, tid);
+                                run_attn_rows(&at, a, b, &mut scratch);
+                            } else {
                                 let (a, b) = split_n(at.m * at.nh, nt, tid);
                                 run_attn(&at, a, b, &mut scratch);
                             }
@@ -280,13 +314,19 @@ impl Pool {
     pub fn attn(&self, job: AttnJob) {
         let scratch = unsafe { &mut *self.scratch.get() };
         if self.nt == 1 {
-            run_attn(&job, 0, job.m * job.nh, scratch);
+            if job.rowbatch { run_attn_rows(&job, 0, job.m, scratch); }
+            else { run_attn(&job, 0, job.m * job.nh, scratch); }
             return;
         }
         unsafe { *self.inner.job.get() = Some(Job::Attn(job)) };
         self.inner.start.wait();
-        let (a, b) = split_n(job.m * job.nh, self.nt, 0);
-        run_attn(&job, a, b, scratch);
+        if job.rowbatch {
+            let (a, b) = split_n(job.m, self.nt, 0);
+            run_attn_rows(&job, a, b, scratch);
+        } else {
+            let (a, b) = split_n(job.m * job.nh, self.nt, 0);
+            run_attn(&job, a, b, scratch);
+        }
         self.inner.done.wait();
     }
 

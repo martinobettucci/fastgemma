@@ -324,7 +324,8 @@ impl<'m> Runner<'m> {
                 vrow: vec![0; kvh * hdmax],
                 logits: vec![0.0; max_logit_rows * cfg.vocab_size],
             },
-            pool: Pool::new(threads, k::attend_scratch(max_ctx + 64, hdmax)),
+            pool: Pool::new(threads, k::attend_scratch(max_ctx + 64, hdmax)
+                    .max(k::rowbatch_scratch(nh, max_ctx + 64, hdmax))),
             layers,
             model,
             cfg,
@@ -540,6 +541,7 @@ impl<'m> Runner<'m> {
             }
 
             let _t = tick!(profiling);
+            let span = pos[..m].iter().copied().max().unwrap_or(0) + 1;
             for r in 0..m {
                 let lk = caches[seq[r]].layers[w.kv_src].as_ref().unwrap();
                 debug_assert!(
@@ -567,6 +569,17 @@ impl<'m> Runner<'m> {
                 hd,
                 m,
                 window: if w.sliding { cfg.sliding_window } else { 0 },
+                // Head-batching pays only once the K set for this layer exceeds
+                // L2; below that the per-head kernel's four-position reduction
+                // amortisation wins. It also needs enough rows to split on,
+                // since one thread owns all heads of a row -- at decode (m=1)
+                // that would serialise attention entirely.
+                rowbatch: m >= 16
+                    && k::rowbatch_worthwhile(
+                        kvh,
+                        hd,
+                        if w.sliding { cfg.sliding_window.min(span) } else { span },
+                    ),
             });
 
             tock!(_t, prof, 5);

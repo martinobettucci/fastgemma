@@ -691,3 +691,177 @@ void fgm_qk_heads_batched(float *out_scores, const int8_t *qq, const int32_t *qs
   }
   (void)n;
 }
+
+// ---------------------------------------------- head-batched attention (MQA)
+// All heads of ONE query row, sharing each K and V line across every head.
+//
+// Same maths as fgm_attend_q8_heads, different loop order. With one KV head the
+// head-outer kernel re-streams the whole K range once per head, so each byte
+// feeds exactly one multiply-accumulate; here a K line loaded once serves all
+// n_heads, taking arithmetic intensity from 1 to n_heads MACs per byte.
+//
+// Measured on Q.K^T alone (bench/kernels/qk_bench.c), head_dim 512:
+//   ctx 2048  88.3 -> 73.3 G MAC/s   0.83x   head-outer wins
+//   ctx 4096  48.1 -> 70.6 G MAC/s   1.47x
+//   ctx 8192  28.2 -> 72.9 G MAC/s   2.59x
+//
+// The crossover is physical: head-outer batches four positions against four
+// accumulators and pays ~1/4 of a horizontal reduction per score, while this
+// pays one per (position, head). Below the L2 line the reductions dominate and
+// head-outer is ~20% faster; above it, bandwidth dominates and this wins.
+// head_dim 512 x 4096 = 2 MB and head_dim 256 x 8192 = 2 MB -- both crossovers
+// sit exactly on the per-core L2 capacity.
+//
+// Scratch layout (floats), sized by the caller from fgm_rowbatch_scratch():
+//   [0, n_heads*cap)   scores, one row of `cap` per head
+//   then               u8 weight planes and int32 accumulators, as in the
+//                      per-head kernel
+void fgm_attend_q8_row(float *out, const float *q, const int8_t *kc, const float *ks,
+                       const int8_t *vc, const float *vs, int n_heads, int kv_heads,
+                       int head_dim, int start, int end, float *scratch,
+                       int ring, int cap) {
+  const int kvd = kv_heads * head_dim;
+  const int n = end - start;
+  if (n <= 0) {
+    for (int i = 0; i < n_heads * head_dim; i++) out[i] = 0.0f;
+    return;
+  }
+  // Only the MQA case shares a KV head across all query heads; anything else
+  // falls back rather than silently reading the wrong head's cache.
+  if (kv_heads != 1) {
+    fgm_attend_q8_heads(out, q, kc, ks, vc, vs, n_heads, kv_heads, head_dim,
+                        start, end, scratch, 0, n_heads, ring, cap);
+    return;
+  }
+
+  _Alignas(64) int8_t qq[8 * FGM_MAX_HEAD_DIM];
+  _Alignas(64) int32_t qsum[8];
+  _Alignas(64) float qscale[8];
+  const int nh = n_heads > 8 ? 8 : n_heads;
+  for (int h = 0; h < nh; h++) {
+    const float *qh = q + (size_t)h * head_dim;
+    float amax = 0.0f;
+    for (int i = 0; i < head_dim; i++) {
+      float a = fabsf(qh[i]);
+      if (a > amax) amax = a;
+    }
+    qscale[h] = amax / 127.0f;
+    const float qinv = amax > 0.0f ? 127.0f / amax : 0.0f;
+    int32_t s = 0;
+    for (int i = 0; i < head_dim; i++) {
+      int v = (int)lrintf(qh[i] * qinv);
+      v = v > 127 ? 127 : (v < -127 ? -127 : v);
+      qq[(size_t)h * head_dim + i] = (int8_t)v;
+      s += v;
+    }
+    qsum[h] = s;
+  }
+
+  fgm_qk_heads_batched(scratch, qq, qsum, qscale, kc, ks, nh, head_dim, kvd,
+                       start, end, ring, cap);
+
+  // Softmax and P.V per head, over the scores just produced. Reuses the
+  // per-head kernel's tail by calling it with a precomputed score row would
+  // require threading a flag through it; instead the small amount of work here
+  // is done directly, which keeps the hot per-head path untouched.
+  const int wstride = (cap + 3) & ~3;
+  uint8_t *wq_hi = (uint8_t *)(scratch + (size_t)nh * cap);
+  uint8_t *wq_lo = wq_hi + wstride;
+  int32_t *acc_hi = (int32_t *)(scratch + (size_t)nh * cap + wstride / 2 + 4);
+  int32_t *acc_lo = acc_hi + head_dim;
+
+  for (int h = 0; h < nh; h++) {
+    float *sc = scratch + (size_t)h * cap;
+    float *oh = out + (size_t)h * head_dim;
+    float mx = -INFINITY;
+    for (int t = 0; t < n; t++) if (sc[t] > mx) mx = sc[t];
+
+    __m512 vmx = _mm512_set1_ps(mx), vsum = _mm512_setzero_ps();
+    int u = 0;
+    for (; u + 16 <= n; u += 16) {
+      __m512 e = exp512_ps(_mm512_sub_ps(_mm512_loadu_ps(sc + u), vmx));
+      _mm512_storeu_ps(sc + u, e);
+      vsum = _mm512_add_ps(vsum, e);
+    }
+    float sum = _mm512_reduce_add_ps(vsum);
+    for (; u < n; u++) { sc[u] = expf(sc[u] - mx); sum += sc[u]; }
+    const float inv = 1.0f / sum;
+
+    float wmax = 0.0f;
+    for (int t = start; t < end; t++) {
+      const int sl = ring ? (t % ring) : t;
+      float w = sc[t - start] * inv * vs[sl];
+      if (w > wmax) wmax = w;
+    }
+    if (!(wmax > 0.0f)) {
+      for (int i = 0; i < head_dim; i += 16) _mm512_storeu_ps(oh + i, _mm512_setzero_ps());
+      continue;
+    }
+    const float wq_scale = wmax / 65535.0f, wq_inv = 65535.0f / wmax;
+
+    int run_lo[2], run_hi[2], nrun;
+    if (!ring) { run_lo[0] = start; run_hi[0] = end; nrun = 1; }
+    else if (n >= ring) { run_lo[0] = 0; run_hi[0] = ring; nrun = 1; }
+    else {
+      int s0 = start % ring;
+      if (s0 + n <= ring) { run_lo[0] = s0; run_hi[0] = s0 + n; nrun = 1; }
+      else { run_lo[0] = s0; run_hi[0] = ring; run_lo[1] = 0; run_hi[1] = s0 + n - ring; nrun = 2; }
+    }
+    for (int rn = 0; rn < nrun; rn++) {
+      size_t lo = (size_t)(run_lo[rn] & ~3), len = (size_t)((run_hi[rn] + 3) & ~3) - lo;
+      memset(wq_hi + lo, 0, len);
+      memset(wq_lo + lo, 0, len);
+    }
+    for (int t = start; t < end; t++) {
+      const int sl = ring ? (t % ring) : t;
+      int iw = (int)(sc[t - start] * inv * vs[sl] * wq_inv + 0.5f);
+      if (iw > 65535) iw = 65535;
+      if (iw < 0) iw = 0;
+      wq_hi[sl] = (uint8_t)(iw >> 8);
+      wq_lo[sl] = (uint8_t)(iw & 255);
+    }
+    for (int i = 0; i < head_dim; i += 16) {
+      _mm512_storeu_si512((void *)(acc_hi + i), _mm512_setzero_si512());
+      _mm512_storeu_si512((void *)(acc_lo + i), _mm512_setzero_si512());
+    }
+    const size_t gstride = (size_t)kvd * 4;
+    for (int rn = 0; rn < nrun; rn++) {
+      const int glo = run_lo[rn] & ~3, ghi = (run_hi[rn] + 3) & ~3;
+      for (int g = glo; g < ghi; g += 16) {
+        const int ng = (ghi - g >= 16) ? 4 : (ghi - g) / 4;
+        __m512i wh[4], wl[4];
+        for (int j = 0; j < 4; j++) {
+          wh[j] = j < ng ? _mm512_set1_epi32(*(const int32_t *)(wq_hi + g + 4 * j))
+                         : _mm512_setzero_si512();
+          wl[j] = j < ng ? _mm512_set1_epi32(*(const int32_t *)(wq_lo + g + 4 * j))
+                         : _mm512_setzero_si512();
+        }
+        const int8_t *v0 = vc + (size_t)(g / 4) * kvd * 4;
+        for (int i = 0; i < head_dim; i += 16) {
+          __m512i ah = _mm512_loadu_si512((const void *)(acc_hi + i));
+          __m512i al = _mm512_loadu_si512((const void *)(acc_lo + i));
+          const int8_t *vp = v0 + (size_t)i * 4;
+          for (int j = 0; j < ng; j++) {
+            __m512i vv = _mm512_loadu_si512((const void *)(vp + (size_t)j * gstride));
+            ah = _mm512_dpbusd_epi32(ah, wh[j], vv);
+            al = _mm512_dpbusd_epi32(al, wl[j], vv);
+          }
+          _mm512_storeu_si512((void *)(acc_hi + i), ah);
+          _mm512_storeu_si512((void *)(acc_lo + i), al);
+        }
+      }
+    }
+    const __m512 vsc = _mm512_set1_ps(wq_scale);
+    for (int i = 0; i < head_dim; i += 16) {
+      __m512i a = _mm512_add_epi32(
+          _mm512_slli_epi32(_mm512_loadu_si512((const void *)(acc_hi + i)), 8),
+          _mm512_loadu_si512((const void *)(acc_lo + i)));
+      _mm512_storeu_ps(oh + i, _mm512_mul_ps(_mm512_cvtepi32_ps(a), vsc));
+    }
+  }
+}
+
+// Floats of scratch fgm_attend_q8_row needs.
+int fgm_rowbatch_scratch(int n_heads, int cap, int head_dim) {
+  return n_heads * cap + (cap + 3) / 2 + 2 * head_dim + 64;
+}

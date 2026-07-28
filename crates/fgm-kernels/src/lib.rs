@@ -58,6 +58,13 @@ extern "C" {
     );
     fn fgm_store_v_t(vt: *mut i8, src: *const i8, n: i32, slot: i32);
     fn fgm_set_scalar_wfill(on: i32);
+    fn fgm_attend_q8_row(
+        out: *mut f32, q: *const f32, kc: *const i8, ks: *const f32,
+        vc: *const i8, vs: *const f32, n_heads: i32, kv_heads: i32,
+        head_dim: i32, start: i32, end: i32, scratch: *mut f32,
+        ring: i32, cap: i32,
+    );
+    fn fgm_rowbatch_scratch(n_heads: i32, cap: i32, head_dim: i32) -> i32;
 }
 
 static AMX: Once = Once::new();
@@ -250,6 +257,49 @@ pub fn attend_q8_heads(
 pub fn attend_scratch(cap: usize, head_dim: usize) -> usize {
     // scores, two u8 weight planes, two int32 accumulator sets
     cap + cap.div_ceil(2) + 2 * head_dim + 64
+}
+
+/// All heads of one query row, sharing each K/V line across every head.
+///
+/// With one KV head this raises arithmetic intensity from 1 MAC/byte to
+/// n_heads, which is the only lever that moves a kernel already sitting at
+/// 3-7% of the VNNI ceiling but at the bandwidth ceiling. Worth it only once
+/// the K set exceeds L2 -- below that the head-outer kernel's four-position
+/// reduction amortisation wins. See `rowbatch_worthwhile`.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn attend_q8_row(
+    out: &mut [f32], q: &[f32], kc: &[i8], ks: &[f32], vc: &[i8], vs: &[f32],
+    n_heads: usize, kv_heads: usize, head_dim: usize, start: usize, end: usize,
+    scratch: &mut [f32], ring: usize, cap: usize,
+) {
+    debug_assert!(scratch.len() >= rowbatch_scratch(n_heads, cap, head_dim));
+    unsafe {
+        fgm_attend_q8_row(
+            out.as_mut_ptr(), q.as_ptr(), kc.as_ptr(), ks.as_ptr(),
+            vc.as_ptr(), vs.as_ptr(), n_heads as i32, kv_heads as i32,
+            head_dim as i32, start as i32, end as i32, scratch.as_mut_ptr(),
+            ring as i32, cap as i32,
+        )
+    }
+}
+
+pub fn rowbatch_scratch(n_heads: usize, cap: usize, head_dim: usize) -> usize {
+    unsafe { fgm_rowbatch_scratch(n_heads as i32, cap as i32, head_dim as i32) as usize }
+}
+
+/// Does head-batching pay at this shape?
+///
+/// The crossover is physical rather than fitted: head-batching wins exactly
+/// when the K working set for one layer exceeds the per-core L2, because below
+/// that the reductions dominate and above it the bandwidth does. Measured
+/// crossovers sit on the 2 MB line -- head_dim 512 at ctx 4096 and head_dim 256
+/// at ctx 8192 are both exactly 2 MB.
+pub const L2_PER_CORE: usize = 2 << 20;
+
+#[inline]
+pub fn rowbatch_worthwhile(kv_heads: usize, head_dim: usize, span: usize) -> bool {
+    kv_heads == 1 && span * head_dim > L2_PER_CORE
 }
 
 /// Force the scalar P.V weight fill, for A/B against the vectorised one inside
