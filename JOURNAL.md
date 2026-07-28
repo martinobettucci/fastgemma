@@ -27,6 +27,7 @@ no GPU. **Target workload:** 8 concurrent requests, ~8k prompt in, ~2k out,
 | Chunked prefill + decode piggyback | **open** | amortise weight reads across both phases |
 | Grammar-constrained tool decoding | **open** | the exactness half of the brief |
 | Activation-sparsity skipping | **n/a** | Gemma 3n had 95% sparsity; **Gemma 4 does not** |
+| AMX tile-state guard (platform defect) | **done** | sentinel-biased accumulator + per-block retry, 1-2% cost |
 | **Speculative multi-token prediction (MTP)** | **queued — after base perf** | https://ai.google.dev/gemma/docs/mtp/overview — explore an MTP drafter *only once base throughput is squeezed out*, per the brief. Decode here is DRAM-bound at batch 8, which is exactly the regime where speculation pays: extra tokens per weight read are ~free. Open questions: does Gemma 4 ship MTP heads for E2B/E4B, or do we train/distil a drafter? How does the accept rate interact with grammar constraints (a rejected draft inside a JSON tool call is cheap to re-mask, so acceptance may be *higher* under constraints)? |
 
 ---
@@ -475,6 +476,68 @@ Note this hits **any** AMX user on this VM, including llama.cpp built with
 `GGML_AMX_*`. Its default AVX512/AVX2 path is unaffected, so the baseline
 comparison is still valid — and it is the honest comparison anyway, since that
 is what llama.cpp actually ships.
+
+### The guard works
+
+Under 6-way CPU contention, same GEMM repeated:
+
+| | q4g mismatches | q8c mismatches | tile resets recovered |
+|---|---|---|---|
+| guard **on**, M=700 ×25 | **0** | **0** | 67 |
+| guard **on**, M=1200 ×15 | **0** | **0** | 123 |
+| guard off, M=700 ×25 | 8 | 11 | — |
+
+End-to-end `ringtest` self-determinism went to **0.000000 at every size**
+(520 / 700 / 1200), and the ring-vs-linear comparison now passes.
+
+Guard cost, measured with `FGM_NO_TILE_GUARD=1`:
+
+| | guard on | guard off | cost |
+|---|---|---|---|
+| prefill 128 | 168.9 | 170.8 | 1.1% |
+| prefill 256 | 164.5 | 168.0 | 2.1% |
+| decode | 15.31 | 15.41 | 0.6% |
+
+**1–2% for correctness under preemption.** It stays on by default.
+
+---
+
+## 9. Baseline: llama.cpp, same box, same model, same bit width
+
+`google/gemma-4-E2B-it-qat-q4_0-gguf` (Google's own QAT Q4_0), llama.cpp
+build 91f8c9c, `GGML_NATIVE=ON`, 4 threads. Both engines measured on an idle
+machine — an earlier fastgemma sweep was contaminated by the llama.cpp build
+running concurrently and read ~15% low.
+
+**Prefill (tok/s):**
+
+| tokens | fastgemma | llama.cpp | |
+|---|---|---|---|
+| 128 | **168.9** | 163.4 | fgm +3% |
+| 256 | **164.5** | 161.0 | fgm +2% |
+| 512 | 142.9 | **158.5** | llama +11% |
+
+Our prefill degrades with length where llama.cpp's does not — that is the naive
+O(M²) attention kernel (§6b), not the GEMM.
+
+**Decode (tok/s aggregate), 512-token prompts, the target workload:**
+
+| concurrency | fastgemma | llama.cpp | |
+|---|---|---|---|
+| 1 | 15.0 | **19.5** | llama +30% |
+| 4 | **46.7** | 40.1 | **fgm +16%** |
+| 8 | **67.3** | 59.7 | **fgm +13%** |
+
+This is exactly the shape the architecture predicts. Single-stream decode is
+pure memory bandwidth and llama.cpp's Q4_0 kernels are extremely well tuned;
+AMX cannot help when M=1. As soon as requests batch, the same weight read serves
+8 rows and the tile units have enough M to work with — and we pull ahead.
+
+**Honest summary: at the concurrency this project was briefed for, fastgemma
+beats llama.cpp on decode by 13%. It does not beat it on single-stream, and
+loses on long prefill.** The remaining levers (K-blocking for L1-resident AMX
+operands, flash-style attention, the still-single-threaded GEMM preamble) all
+point the same way, and none of them are exhausted.
 
 ---
 

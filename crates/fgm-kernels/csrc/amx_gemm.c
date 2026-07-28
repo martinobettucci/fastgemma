@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <immintrin.h>
+#include <stdatomic.h>
 
 #define ARCH_REQ_XCOMP_PERM 0x1023
 #define XFEATURE_XTILEDATA 18
@@ -114,14 +115,79 @@ void fgm_pack_a(int M, int K, const int8_t *A, int8_t *Ap) {
 
 // acc_f32[m][n] += (float)acc_i32[m][n] * bs[n], one 16-wide n block
 static inline void drain16(const int32_t *ai, int mr, float *af, int ldaf,
-                           const _Float16 *bs) {
+                           const _Float16 *bs, int32_t bias) {
   __m512 s = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)bs));
+  __m512i b = _mm512_set1_epi32(bias);
   for (int m = 0; m < mr; m++) {
-    __m512 f = _mm512_cvtepi32_ps(_mm512_loadu_si512(ai + m * 16));
+    __m512i v = _mm512_sub_epi32(_mm512_loadu_si512(ai + m * 16), b);
+    __m512 f = _mm512_cvtepi32_ps(v);
     _mm512_storeu_ps(af + m * ldaf,
                      _mm512_fmadd_ps(f, s, _mm512_loadu_ps(af + m * ldaf)));
   }
 }
+
+
+// ------------------------------------------------------- tile-state sentinel
+// This VM does not preserve XTILEDATA across context switches: tiles come back
+// ZEROED (see bench/platform/amx_tilestate.c -- 16% loss for state held 1 ms
+// under load, 89% at 10 ms). An accumulator held across a k-loop therefore
+// silently loses everything summed before the switch, and the result looks
+// plausible rather than obviously broken.
+//
+// Detection costs no tile register and no blocking: seed each accumulator with
+// a large constant instead of zeroing it. An intact tile reads back as
+// SENTINEL + sum; a tile that was reset reads back as just the partial sum.
+//
+//   SENTINEL   = 2^30                    = 1073741824
+//   |sum|     <= Kmax * 127 * 127        =  198193152  (K = 12288, worst case)
+//
+// so an intact accumulator is always > SENTINEL/2 and a reset one always well
+// below it. One compare per stored tile detects the reset; the drain subtracts
+// SENTINEL to recover the true sum. On detection the block is recomputed --
+// per-block windows are sub-microsecond, so retries are rare and cheap.
+//
+// Set FGM_NO_TILE_GUARD=1 to disable, for measuring the guard's own cost.
+#define SENTINEL 0x40000000
+#define SENT_MIN 0x20000000  /* SENTINEL/2 */
+#define MAX_RETRY 16
+
+static const int32_t *acc_seed(void) {
+  static _Alignas(64) int32_t seed[256];
+  static int init = 0;
+  if (!init) {
+    for (int i = 0; i < 256; i++) seed[i] = SENTINEL;
+    init = 1;
+  }
+  return seed;
+}
+
+static int guard_on = -1;
+static inline int tile_guard(void) {
+  if (guard_on < 0) {
+    const char *e = getenv("FGM_NO_TILE_GUARD");
+    guard_on = !(e && e[0] == '1');
+  }
+  return guard_on;
+}
+
+// A reset tile has lost the seed, so every element is small.
+static inline int tile_intact(const int32_t *acc, int mr) {
+  for (int m = 0; m < mr; m++)
+    if (acc[m * 16] < SENT_MIN) return 0;
+  return 1;
+}
+
+// Number of corruptions detected and recovered, for reporting.
+static _Atomic long fgm_tile_retries = 0;
+long fgm_tile_retry_count(void) { return atomic_load(&fgm_tile_retries); }
+void fgm_tile_retry_reset(void) { atomic_store(&fgm_tile_retries, 0); }
+
+// Seed an accumulator: SENTINEL everywhere when guarding, else plain zero.
+#define ACC_SEED(T)                                                            \
+  do {                                                                         \
+    if (guarded) _tile_loadd(T, seedp, 64);                                    \
+    else _tile_zero(T);                                                        \
+  } while (0)
 
 #define PK_TILE 512   // packed int4 tile bytes
 #define Q8_TILE 1024  // int8 tile bytes
@@ -145,46 +211,68 @@ static inline int panel_nblocks(int K, int bytes_per_weight_x2) {
   do {                                                                                 \
     float *C0 = C + (size_t)(MB) * ldc + nb * 16;                                       \
     float *C1 = C + (size_t)((MB) + 16) * ldc + nb * 16;                                \
-    for (int m = 0; m < (MR0); m++) memset(C0 + (size_t)m * ldc, 0, 2 * 64);            \
-    for (int m = 0; m < (MR1); m++) memset(C1 + (size_t)m * ldc, 0, 2 * 64);            \
-    for (int kb0 = 0; kb0 < KB; kb0 += gk) {                                            \
-      _tile_zero(0); _tile_zero(1); _tile_zero(2); _tile_zero(3);                       \
-      for (int kb = kb0; kb < kb0 + gk; kb++) {                                          \
-        const uint8_t *bp = Bq + (size_t)nb * nbs + (size_t)kb * PK_TILE;                \
-        _tile_loadd(4, A + (((size_t)(MB) / 16 * KB) + kb) * 1024, 64);                               \
-        _tile_loadd(5, A + (((size_t)((MB) + 16) / 16 * KB) + kb) * 1024, 64);                        \
-        unpack_tile(bp, bt[0]);                                                          \
-        _tile_loadd(6, bt[0], 64); _tile_dpbssd(0, 4, 6); _tile_dpbssd(2, 5, 6);         \
-        unpack_tile(bp + nbs, bt[1]);                                                    \
-        _tile_loadd(7, bt[1], 64); _tile_dpbssd(1, 4, 7); _tile_dpbssd(3, 5, 7);         \
-      }                                                                                  \
-      const _Float16 *bs = b_scale + (size_t)(kb0 / gk) * N + nb * 16;                   \
-      _tile_stored(0, acc[0], 64); drain16(acc[0], (MR0), C0,      ldc, bs);             \
-      _tile_stored(1, acc[1], 64); drain16(acc[1], (MR0), C0 + 16, ldc, bs + 16);        \
-      _tile_stored(2, acc[2], 64); drain16(acc[2], (MR1), C1,      ldc, bs);             \
-      _tile_stored(3, acc[3], 64); drain16(acc[3], (MR1), C1 + 16, ldc, bs + 16);        \
-    }                                                                                    \
+    for (int att = 0; att < MAX_RETRY; att++) {                                          \
+      int bad = 0;                                                                       \
+      for (int m = 0; m < (MR0); m++) memset(C0 + (size_t)m * ldc, 0, 2 * 64);            \
+      for (int m = 0; m < (MR1); m++) memset(C1 + (size_t)m * ldc, 0, 2 * 64);            \
+      for (int kb0 = 0; kb0 < KB && !bad; kb0 += gk) {                                    \
+        ACC_SEED(0); ACC_SEED(1); ACC_SEED(2); ACC_SEED(3);                               \
+        for (int kb = kb0; kb < kb0 + gk; kb++) {                                          \
+          const uint8_t *bp = Bq + (size_t)nb * nbs + (size_t)kb * PK_TILE;                \
+          _tile_loadd(4, A + (((size_t)(MB) / 16 * KB) + kb) * 1024, 64);                  \
+          _tile_loadd(5, A + (((size_t)((MB) + 16) / 16 * KB) + kb) * 1024, 64);           \
+          unpack_tile(bp, bt[0]);                                                          \
+          _tile_loadd(6, bt[0], 64); _tile_dpbssd(0, 4, 6); _tile_dpbssd(2, 5, 6);         \
+          unpack_tile(bp + nbs, bt[1]);                                                    \
+          _tile_loadd(7, bt[1], 64); _tile_dpbssd(1, 4, 7); _tile_dpbssd(3, 5, 7);         \
+        }                                                                                  \
+        const _Float16 *bs = b_scale + (size_t)(kb0 / gk) * N + nb * 16;                   \
+        _tile_stored(0, acc[0], 64); _tile_stored(1, acc[1], 64);                          \
+        _tile_stored(2, acc[2], 64); _tile_stored(3, acc[3], 64);                          \
+        if (guarded && !(tile_intact(acc[0], (MR0)) && tile_intact(acc[1], (MR0)) &&       \
+                         tile_intact(acc[2], (MR1)) && tile_intact(acc[3], (MR1)))) {      \
+          bad = 1; break;                                                                  \
+        }                                                                                  \
+        drain16(acc[0], (MR0), C0,      ldc, bs,      bias);                               \
+        drain16(acc[1], (MR0), C0 + 16, ldc, bs + 16, bias);                               \
+        drain16(acc[2], (MR1), C1,      ldc, bs,      bias);                               \
+        drain16(acc[3], (MR1), C1 + 16, ldc, bs + 16, bias);                               \
+      }                                                                                    \
+      if (!bad) break;                                                                     \
+      atomic_fetch_add(&fgm_tile_retries, 1);                                              \
+    }                                                                                      \
   } while (0)
 
 #define INNER_Q4_1x4(MB, MR)                                                            \
   do {                                                                                   \
     float *Cb = C + (size_t)(MB) * ldc + nb * 16;                                         \
-    for (int m = 0; m < (MR); m++) memset(Cb + (size_t)m * ldc, 0, 4 * 64);               \
-    for (int kb0 = 0; kb0 < KB; kb0 += gk) {                                              \
-      _tile_zero(0); _tile_zero(1); _tile_zero(2); _tile_zero(3);                         \
-      for (int kb = kb0; kb < kb0 + gk; kb++) {                                            \
-        const uint8_t *bp = Bq + (size_t)nb * nbs + (size_t)kb * PK_TILE;                  \
-        _tile_loadd(4, A + (((size_t)(MB) / 16 * KB) + kb) * 1024, 64);                                 \
-        unpack_tile(bp, bt[0]);           _tile_loadd(5, bt[0], 64); _tile_dpbssd(0, 4, 5);\
-        unpack_tile(bp + nbs, bt[1]);     _tile_loadd(5, bt[1], 64); _tile_dpbssd(1, 4, 5);\
-        unpack_tile(bp + 2 * nbs, bt[2]); _tile_loadd(5, bt[2], 64); _tile_dpbssd(2, 4, 5);\
-        unpack_tile(bp + 3 * nbs, bt[3]); _tile_loadd(5, bt[3], 64); _tile_dpbssd(3, 4, 5);\
+    for (int att = 0; att < MAX_RETRY; att++) {                                           \
+      int bad = 0;                                                                        \
+      for (int m = 0; m < (MR); m++) memset(Cb + (size_t)m * ldc, 0, 4 * 64);             \
+      for (int kb0 = 0; kb0 < KB && !bad; kb0 += gk) {                                    \
+        ACC_SEED(0); ACC_SEED(1); ACC_SEED(2); ACC_SEED(3);                               \
+        for (int kb = kb0; kb < kb0 + gk; kb++) {                                          \
+          const uint8_t *bp = Bq + (size_t)nb * nbs + (size_t)kb * PK_TILE;                \
+          _tile_loadd(4, A + (((size_t)(MB) / 16 * KB) + kb) * 1024, 64);                  \
+          unpack_tile(bp, bt[0]);           _tile_loadd(5, bt[0], 64); _tile_dpbssd(0, 4, 5);\
+          unpack_tile(bp + nbs, bt[1]);     _tile_loadd(5, bt[1], 64); _tile_dpbssd(1, 4, 5);\
+          unpack_tile(bp + 2 * nbs, bt[2]); _tile_loadd(5, bt[2], 64); _tile_dpbssd(2, 4, 5);\
+          unpack_tile(bp + 3 * nbs, bt[3]); _tile_loadd(5, bt[3], 64); _tile_dpbssd(3, 4, 5);\
+        }                                                                                  \
+        const _Float16 *bs = b_scale + (size_t)(kb0 / gk) * N + nb * 16;                   \
+        _tile_stored(0, acc[0], 64); _tile_stored(1, acc[1], 64);                          \
+        _tile_stored(2, acc[2], 64); _tile_stored(3, acc[3], 64);                          \
+        if (guarded && !(tile_intact(acc[0], (MR)) && tile_intact(acc[1], (MR)) &&         \
+                         tile_intact(acc[2], (MR)) && tile_intact(acc[3], (MR)))) {        \
+          bad = 1; break;                                                                  \
+        }                                                                                  \
+        drain16(acc[0], (MR), Cb,      ldc, bs,      bias);                                \
+        drain16(acc[1], (MR), Cb + 16, ldc, bs + 16, bias);                                \
+        drain16(acc[2], (MR), Cb + 32, ldc, bs + 32, bias);                                \
+        drain16(acc[3], (MR), Cb + 48, ldc, bs + 48, bias);                                \
       }                                                                                    \
-      const _Float16 *bs = b_scale + (size_t)(kb0 / gk) * N + nb * 16;                     \
-      _tile_stored(0, acc[0], 64); drain16(acc[0], (MR), Cb,      ldc, bs);                \
-      _tile_stored(1, acc[1], 64); drain16(acc[1], (MR), Cb + 16, ldc, bs + 16);           \
-      _tile_stored(2, acc[2], 64); drain16(acc[2], (MR), Cb + 32, ldc, bs + 32);           \
-      _tile_stored(3, acc[3], 64); drain16(acc[3], (MR), Cb + 48, ldc, bs + 48);           \
+      if (!bad) break;                                                                     \
+      atomic_fetch_add(&fgm_tile_retries, 1);                                              \
     }                                                                                      \
   } while (0)
 
@@ -197,6 +285,9 @@ void fgm_gemm_q4g(int M, int N, int K, const int8_t *A, const float *a_scale,
   _Alignas(64) int8_t bt[4][1024];
   _Alignas(64) int32_t acc[4][256];
 
+  const int guarded = tile_guard();
+  const int32_t *seedp = acc_seed();
+  const int32_t bias = guarded ? SENTINEL : 0;
   const int npanel = panel_nblocks(K, 1);   // int4: 0.5 byte/weight
   const int M32 = M & ~31;
   const int rem = M - M32;
@@ -230,38 +321,48 @@ void fgm_gemm_q4g(int M, int N, int K, const int8_t *A, const float *a_scale,
 #define INNER_Q8_2x2(MB, MR0, MR1)                                                      \
   do {                                                                                   \
     const int8_t *bp0 = B + (size_t)nb * nbs;                                            \
-    _tile_zero(0); _tile_zero(1); _tile_zero(2); _tile_zero(3);                          \
+    for (int att = 0; att < MAX_RETRY; att++) {                                           \
+    ACC_SEED(0); ACC_SEED(1); ACC_SEED(2); ACC_SEED(3);                                   \
     for (int kb = 0; kb < KB; kb++) {                                                     \
       const int8_t *bp = bp0 + (size_t)kb * Q8_TILE;                                      \
-      _tile_loadd(4, A + (((size_t)(MB) / 16 * KB) + kb) * 1024, 64);                                  \
-      _tile_loadd(5, A + (((size_t)((MB) + 16) / 16 * KB) + kb) * 1024, 64);                           \
+      _tile_loadd(4, A + (((size_t)(MB) / 16 * KB) + kb) * 1024, 64);                     \
+      _tile_loadd(5, A + (((size_t)((MB) + 16) / 16 * KB) + kb) * 1024, 64);              \
       _tile_loadd(6, bp, 64);       _tile_dpbssd(0, 4, 6); _tile_dpbssd(2, 5, 6);         \
       _tile_loadd(7, bp + nbs, 64); _tile_dpbssd(1, 4, 7); _tile_dpbssd(3, 5, 7);         \
     }                                                                                     \
     _tile_stored(0, acc[0], 64); _tile_stored(1, acc[1], 64);                             \
     _tile_stored(2, acc[2], 64); _tile_stored(3, acc[3], 64);                             \
+    if (guarded && !(tile_intact(acc[0], (MR0)) && tile_intact(acc[1], (MR0)) &&          \
+                     tile_intact(acc[2], (MR1)) && tile_intact(acc[3], (MR1)))) {         \
+      atomic_fetch_add(&fgm_tile_retries, 1); continue;                                   \
+    }                                                                                     \
     for (int t = 0; t < 2; t++) {                                                          \
       __m512 bs = _mm512_loadu_ps(b_scale + (nb + t) * 16);                                \
       for (int m = 0; m < (MR0); m++) {                                                     \
-        __m512 f = _mm512_cvtepi32_ps(_mm512_loadu_si512(acc[t] + m * 16));                 \
+        __m512i v = _mm512_sub_epi32(_mm512_loadu_si512(acc[t] + m * 16), vbias);           \
+        __m512 f = _mm512_cvtepi32_ps(v);                                                   \
         _mm512_storeu_ps(C + (size_t)((MB) + m) * ldc + (nb + t) * 16,                      \
             _mm512_mul_ps(f, _mm512_mul_ps(bs, _mm512_set1_ps(a_scale[(MB) + m]))));        \
       }                                                                                     \
       for (int m = 0; m < (MR1); m++) {                                                     \
-        __m512 f = _mm512_cvtepi32_ps(_mm512_loadu_si512(acc[2 + t] + m * 16));             \
+        __m512i v = _mm512_sub_epi32(_mm512_loadu_si512(acc[2 + t] + m * 16), vbias);       \
+        __m512 f = _mm512_cvtepi32_ps(v);                                                   \
         _mm512_storeu_ps(C + (size_t)((MB) + 16 + m) * ldc + (nb + t) * 16,                 \
             _mm512_mul_ps(f, _mm512_mul_ps(bs, _mm512_set1_ps(a_scale[(MB) + 16 + m]))));   \
       }                                                                                     \
+    }                                                                                       \
+    break;                                                                                  \
     }                                                                                       \
   } while (0)
 
 #define INNER_Q8_1x4(MB, MR)                                                              \
   do {                                                                                     \
     const int8_t *bp0 = B + (size_t)nb * nbs;                                              \
-    _tile_zero(0); _tile_zero(1); _tile_zero(2); _tile_zero(3);                            \
+    for (int att = 0; att < MAX_RETRY; att++) {                                             \
+    ACC_SEED(0); ACC_SEED(1); ACC_SEED(2); ACC_SEED(3);                                     \
     for (int kb = 0; kb < KB; kb++) {                                                       \
       const int8_t *bp = bp0 + (size_t)kb * Q8_TILE;                                        \
-      _tile_loadd(4, A + (((size_t)(MB) / 16 * KB) + kb) * 1024, 64);                                    \
+      _tile_loadd(4, A + (((size_t)(MB) / 16 * KB) + kb) * 1024, 64);                       \
       _tile_loadd(5, bp, 64);           _tile_dpbssd(0, 4, 5);                              \
       _tile_loadd(5, bp + nbs, 64);     _tile_dpbssd(1, 4, 5);                              \
       _tile_loadd(5, bp + 2 * nbs, 64); _tile_dpbssd(2, 4, 5);                              \
@@ -269,13 +370,20 @@ void fgm_gemm_q4g(int M, int N, int K, const int8_t *A, const float *a_scale,
     }                                                                                       \
     _tile_stored(0, acc[0], 64); _tile_stored(1, acc[1], 64);                               \
     _tile_stored(2, acc[2], 64); _tile_stored(3, acc[3], 64);                               \
+    if (guarded && !(tile_intact(acc[0], (MR)) && tile_intact(acc[1], (MR)) &&              \
+                     tile_intact(acc[2], (MR)) && tile_intact(acc[3], (MR)))) {             \
+      atomic_fetch_add(&fgm_tile_retries, 1); continue;                                     \
+    }                                                                                       \
     for (int t = 0; t < 4; t++) {                                                            \
       __m512 bs = _mm512_loadu_ps(b_scale + (nb + t) * 16);                                  \
       for (int m = 0; m < (MR); m++) {                                                        \
-        __m512 f = _mm512_cvtepi32_ps(_mm512_loadu_si512(acc[t] + m * 16));                   \
+        __m512i v = _mm512_sub_epi32(_mm512_loadu_si512(acc[t] + m * 16), vbias);             \
+        __m512 f = _mm512_cvtepi32_ps(v);                                                     \
         _mm512_storeu_ps(C + (size_t)((MB) + m) * ldc + (nb + t) * 16,                        \
             _mm512_mul_ps(f, _mm512_mul_ps(bs, _mm512_set1_ps(a_scale[(MB) + m]))));          \
       }                                                                                       \
+    }                                                                                         \
+    break;                                                                                    \
     }                                                                                         \
   } while (0)
 
@@ -287,6 +395,9 @@ void fgm_gemm_q8c(int M, int N, int K, const int8_t *A, const float *a_scale,
   _Alignas(64) int32_t acc[4][256];
   (void)N;
 
+  const int guarded = tile_guard();
+  const int32_t *seedp = acc_seed();
+  const __m512i vbias = _mm512_set1_epi32(guarded ? SENTINEL : 0);
   const int npanel = panel_nblocks(K, 2);   // int8: 1 byte/weight
   const int M32 = M & ~31;
   const int rem = M - M32;

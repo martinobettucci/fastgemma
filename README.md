@@ -139,22 +139,50 @@ gcc -O3 -march=sapphirerapids -mamx-int8 -mamx-tile -mavx512fp16 \
 python3 convert/convert_gemma4.py --src <hf-dir> --out model.fgm
 ```
 
+## vs llama.cpp (same box, same model, same bit width)
+
+Baseline is `google/gemma-4-E2B-it-qat-q4_0-gguf` — Google's own QAT Q4_0 GGUF —
+on llama.cpp build 91f8c9c with `GGML_NATIVE=ON`, 4 threads, idle machine.
+
+**Decode, aggregate tok/s, 512-token prompts:**
+
+| concurrency | fastgemma | llama.cpp | |
+|---|---|---|---|
+| 1 | 15.0 | **19.5** | llama +30% |
+| 4 | **46.7** | 40.1 | **fastgemma +16%** |
+| 8 | **67.3** | 59.7 | **fastgemma +13%** |
+
+**Prefill, tok/s:**
+
+| tokens | fastgemma | llama.cpp | |
+|---|---|---|---|
+| 128 | **168.9** | 163.4 | fastgemma +3% |
+| 256 | **164.5** | 161.0 | fastgemma +2% |
+| 512 | 142.9 | **158.5** | llama +11% |
+
+At the concurrency this project was briefed for — 8 requests — fastgemma is
+**13% faster on decode**. It is *not* faster single-stream: at M=1 decode is pure
+memory bandwidth and AMX has nothing to work with, while llama.cpp's Q4_0 kernels
+are extremely well tuned. The advantage appears exactly when requests batch and
+one weight read serves 8 rows. Long prefill still favours llama.cpp because our
+attention kernel is naive and O(M²) — that is the next fix, not a ceiling.
+
 ## Results so far (E2B, 4 threads, int4 group 256)
 
 Prefill, single sequence:
 
 | tokens | tok/s |
 |---|---|
-| 128 | 118.4 |
-| 256 | **142.4** |
-| 512 | 131.9 |
+| 128 | 168.9 |
+| 256 | **164.5** |
+| 512 | 142.9 |
 
 Decode:
 
 | | tok/s |
 |---|---|
-| 1 sequence | 14.5 |
-| 8 concurrent, aggregate | **58.7** (4.05× batching win) |
+| 1 sequence | 15.3 |
+| 8 concurrent, aggregate | **67.3** (4.5× batching win) |
 
 KV cache at 8 concurrent × 10k context: **320 MB total, 40 MB/seq.**
 
