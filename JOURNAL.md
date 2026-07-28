@@ -1697,3 +1697,55 @@ unpack kernels for a cache whose answers are unusable. The prior was right
 (g512's +3.9% weight error already cost a tool call, so a far coarser KV would
 be worse) but the *magnitude* was not: I expected degradation, not collapse.
 Priors are good for ordering experiments and bad for skipping them.
+
+
+---
+
+## 27. A bug I shipped by deferring a test
+
+The head-batched integration's control arm — plain head-outer attention, the
+path that has shipped all session — **failed the ring regression**: max abs
+logit diff **0.941599**, argmax disagreeing. Self-determinism was 0.000000, so
+it was not AMX corruption. A deterministic ring-vs-non-ring divergence means a
+real bug.
+
+It was mine, from §20's vectorised weight fill:
+
+| path | computes | rounds |
+|---|---|---|
+| vectorised (non-ring) | `(sc·vs) · (inv·wq_inv)` | half-to-even |
+| scalar (ring) | `((sc·inv)·vs) · wq_inv` | half-up |
+
+Different association, different rounding rule. Ring layers took the scalar
+path and non-ring layers the vectorised one, so **the same position quantised
+differently depending on whether its layer used a ring buffer.**
+
+### How it got in
+
+The commit that added it says, in its own message: *"Not yet rebuilt: a
+concurrency-8 weights A/B is on the box and building during a measurement is
+how one of the five contamination incidents happened."* That was a correct
+reason not to build **at that moment**. It was not a reason to never run the
+test, and I never came back to it. Four commits and several hours of
+measurement followed, all on a subtly inconsistent kernel.
+
+The change was also **already known to be worthless**: §20 measured it at 0.7%
+prefill and 0.2% decode, both inside noise, because 28 of 35 layers are sliding
+and took the scalar path regardless. So the ledger is a broken correctness
+guard bought with nothing.
+
+Deleted. Ring regression returns to **max abs logit diff 0.000000, PASS**.
+
+**Trap 21 — "verify later" is a decision to ship unverified.** Deferring a test
+for a real reason is fine; what is not fine is that nothing recorded the debt.
+The stop-and-measure discipline that protected every *published number* in this
+project had no equivalent for *correctness*, so a deferred test simply
+evaporated. The ring regression is cheap — it should run on every kernel change,
+not when I remember.
+
+**And note which test caught it.** Not the behavioural gate: 25/25 tools and 7/7
+retention passed *with the bug active*, because both roundings are individually
+valid quantisations and the model tolerated the inconsistency. Only the
+bit-identity assertion between ring and non-ring caches could see it. Behavioural
+gates catch behavioural regressions; they do not catch a kernel quietly
+disagreeing with itself, and a project needs both.
