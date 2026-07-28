@@ -1749,3 +1749,82 @@ valid quantisations and the model tolerated the inconsistency. Only the
 bit-identity assertion between ring and non-ring caches could see it. Behavioural
 gates catch behavioural regressions; they do not catch a kernel quietly
 disagreeing with itself, and a project needs both.
+
+
+---
+
+## 28. MTP: no heads for E2B, and the real opportunity is not what the numbers suggested
+
+Queued from the start as "explore only once base performance is squeezed",
+per the brief. Base work is done, so: what does MTP actually offer here?
+
+### There is no drafter to load
+
+The checkpoint has **2011 tensors and zero** matching
+`mtp|multi_token|draft|predict|speculat|nextn`, and `config.json` mentions none
+of them. Google's own overview names **Gemma 4 26B A4B** as the MTP-equipped
+variant; the E2B/E4B mention in that document is the "Efficient Embedder",
+which is the per-layer embedding table this engine already handles — not a
+draft head.
+
+So the shipped-drafter path does not exist for E2B. Training or distilling one
+is out of scope. That leaves the two weight-free options.
+
+### Option 1: grammar-forced batching — exact, and smaller than it looks
+
+A token the DFA forces is determined **independently of the model**, so a run
+of k consecutive forced tokens can be emitted at once and its KV advanced in a
+single batched forward. This is not speculation: no draft, no verification, no
+acceptance rate, no risk. k steps collapse to 1.
+
+The headline number said 34–42% of decode steps are forced. The number that
+matters is different:
+
+| schema | forced | runs | collapsible |
+|---|---|---|---|
+| synthetic (`tool_N`, `p0`) | 15/36 = 42% | `[1,2,1,1,2,1,1,2,2,1,1]` | **4/36 = 11%** |
+| real (`get_weather`, `depart_date`) | 15/44 = 34% | `[1,2,2,1,1,1,1,1,2,3]` | **5/44 = 11%** |
+
+**Eleven percent, not forty.** Batching a run of length 1 collapses nothing,
+and most runs are length 1–2 because the grammar's structural literals are
+short relative to the free content between them. Longer real-world tool names
+did not help: 34% forced with longer runs nets the same 11% as 42% forced with
+shorter ones.
+
+Worth implementing — it is exact and cheap — but it is a modest win, and
+quoting the 42% as if it were the speedup would have been wrong by ~4x.
+
+### Option 2: prompt-lookup speculation — the better fit, and why
+
+Tool arguments are *copied from the prompt*. "Tokyo", "2026-08-03",
+"dana@corp.com" all appear verbatim in the user turn. Prompt-lookup decoding
+exploits exactly that: find the last n emitted tokens inside the prompt, draft
+whatever followed them there, verify in one batched forward. No weights, no
+drafter, no training.
+
+Measured over the 25 eval tool calls with a 2-gram lookup, **no model
+required**:
+
+    200 / 924 generated tokens correctly drafted = 21.6%
+
+Twice the grammar-batching win, and the two **compose**: the grammar constrains
+what a draft is allowed to be, which should raise acceptance further, and a
+rejected draft inside a constrained region is cheap to re-mask.
+
+This is the MTP path for this engine. It fits the decode regime precisely:
+decode is weight-read bound, so a forward with m=k rows costs about what m=1
+costs — which is the entire premise of speculative decoding, and the reason
+batch-8 decode already delivers 4.5x over batch-1 here.
+
+### Status
+
+Both are designed and sized; neither is implemented end to end, because the
+host lost its AMX units and the engine cannot run. The sizing above needed no
+AMX — it is DFA walks and tokeniser arithmetic — which is why it was worth
+doing now rather than waiting.
+
+**Trap 22 — a percentage is not a speedup until you know its shape.** "42% of
+steps are forced" and "11% of steps are collapsible" describe the same
+measurement. The first is what the instrument reported; the second is what the
+optimisation can actually take. The difference is entirely in the run-length
+distribution, which nobody thinks to ask for.

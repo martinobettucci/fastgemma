@@ -424,7 +424,14 @@ fn main() {
             println!("\n== constrained tool calling: {ntools} tools x {nparams} params ==");
             println!("  vocab {} tokens loaded in {:?}", vocab.len(), t.elapsed());
 
-            let tools = synthetic_tools(ntools, nparams);
+            // FGM_TOOLSPEC measures the real schema. Forced-run length depends
+            // strongly on name length, and synthetic tool_N/p0 names are the
+            // shortest possible case -- the least favourable estimate of the
+            // batching win, not a representative one.
+            let tools = match std::env::var("FGM_TOOLSPEC") {
+                Ok(p) => load_toolspec(&p),
+                Err(_) => synthetic_tools(ntools, nparams),
+            };
             let t = Instant::now();
             let dfa = GrammarBuilder::build(&tools);
             let mut c = Constraint::compile(dfa, &vocab);
@@ -491,6 +498,51 @@ fn main() {
             println!("  forced steps (mask admits exactly 1 token): {forced}/{steps} = {:.0}%",
                      100.0 * forced as f64 / steps.max(1) as f64);
             println!("  -> those steps can skip the 201 MB int4 LM-head read entirely");
+
+            // Run lengths matter more than the raw percentage. A forced token is
+            // determined by the DFA alone, independent of the model, so a RUN of
+            // k consecutive forced tokens can be emitted at once and its KV
+            // advanced in a single batched forward -- k steps collapse to 1.
+            // Scattered forced steps collapse nothing. This is exact, not
+            // speculative: no draft, no verification, no acceptance rate.
+            {
+                let mut c2 = Constraint::compile(GrammarBuilder::build(&tools), &vocab);
+                c2.reset();
+                let mut runs: Vec<usize> = Vec::new();
+                let mut cur = 0usize;
+                let mut n = 0usize;
+                while !c2.done() && n < 4096 {
+                    if let Some(f) = c2.forced() {
+                        cur += 1;
+                        c2.advance(f);
+                    } else {
+                        if cur > 0 { runs.push(cur); cur = 0; }
+                        let mut pick = usize::MAX;
+                        for t in 0..vocab.len() {
+                            if !c2.allowed(t) { continue; }
+                            if vocab[t].is_empty() { pick = t; break; }
+                            let before = c2.state;
+                            let mut probe = before;
+                            let mut ok = true;
+                            for &b in &vocab[t] {
+                                match c2.peek(probe, b) { Some(x) => probe = x, None => { ok = false; break; } }
+                            }
+                            if ok && probe != before { pick = t; break; }
+                        }
+                        if pick == usize::MAX { break; }
+                        c2.advance(pick);
+                    }
+                    n += 1;
+                }
+                if cur > 0 { runs.push(cur); }
+                let total: usize = runs.iter().sum();
+                let saved: usize = runs.iter().map(|r| r - 1).sum();
+                println!("  forced RUNS: {:?}", runs);
+                println!("  -> {} forced tokens in {} runs; batching each run into one",
+                         total, runs.len());
+                println!("     forward collapses {saved} of {n} decode steps ({:.0}%)",
+                         100.0 * saved as f64 / n.max(1) as f64);
+            }
             println!("  emitted: {}", &text[..text.len().min(200)]);
             match parse_call(&text) {
                 Some(call) => {
