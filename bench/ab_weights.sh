@@ -8,10 +8,16 @@
 set -u
 M=${1:-/home/user/models/g4e2b-dual.fgm}
 BIN=./target/release/fgm-bench
+# Wait for a genuinely free box. Checking loadavg alone is not enough: it is a
+# one-minute decaying average, so a four-thread competitor one second old barely
+# moves it. An orphaned bench from a killed run slipped past exactly that check
+# and made one arm of this comparison read 2x low.
 idle() {
-  for _ in $(seq 120); do
-    l=$(awk '{print $1}' /proc/loadavg)
-    if (( $(echo "$l < 1.0" | bc -l) )); then return; fi
+  for _ in $(seq 240); do
+    if ! pgrep -x fgm-bench >/dev/null; then
+      l=$(awk '{print $1}' /proc/loadavg)
+      if (( $(echo "$l < 1.0" | bc -l) )); then return; fi
+    fi
     sleep 5
   done
   echo "WARNING: box never went idle" >&2

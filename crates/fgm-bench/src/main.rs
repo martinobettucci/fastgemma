@@ -10,16 +10,67 @@ use fgm_core::forward::{NPHASE, PHASE_NAMES};
 use fgm_core::{KvCache, Model, Runner};
 use std::time::Instant;
 
+fn loadavg() -> f64 {
+    std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse().ok())
+        .unwrap_or(0.0)
+}
+
+/// PIDs of other fgm-bench processes running right now.
+///
+/// Matched on /proc/<pid>/comm, which is the executable name -- not the command
+/// line, which would also match any shell whose arguments happen to mention
+/// fgm-bench, including a watcher waiting for this very process to exit.
+fn sibling_benches() -> Vec<u32> {
+    let me = std::process::id();
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir("/proc") else { return out };
+    for e in rd.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        if let Ok(c) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+            if c.trim() == "fgm-bench" {
+                out.push(pid);
+            }
+        }
+    }
+    out
+}
+
 /// Refuse to benchmark on a loaded machine.
 ///
-/// Contention has silently corrupted measurements three times in this project:
-/// a concurrent conversion made prefill read 15% low, a concurrent build made it
-/// read ~40% low, and stray benchmark processes from a timed-out loop made a
-/// change look like a regression when it was not. Loadavg is cheap to check and
-/// the failure mode is expensive, so check it.
-fn check_load() {
-    let la = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
-    let one: f64 = la.split_whitespace().next().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+/// Contention has silently corrupted measurements five times in this project: a
+/// concurrent conversion made prefill read 15% low, a concurrent build made it
+/// read ~40% low, stray processes from a timed-out loop made a change look like
+/// a regression when it was not, a `cargo build` fired off mid-run, and an
+/// orphaned bench from a killed script made an int4/int8 comparison read 2x low
+/// on one side only.
+///
+/// That last one got through the loadavg check, and the reason matters:
+/// **loadavg is a one-minute decaying average, so it badly under-reports a
+/// competitor that just started.** A four-thread process one second old barely
+/// moves it. So the primary check is now the direct one -- is another bench
+/// running at all -- with loadavg kept as a secondary signal for everything
+/// else (builds, conversions, whatever else the box is doing).
+fn check_load() -> f64 {
+    let sibs = sibling_benches();
+    if !sibs.is_empty() {
+        eprintln!(
+            "\n*** REFUSING: {} other fgm-bench process(es) running ({sibs:?}). \
+             Two benches on 4 cores read about 2x low, and loadavg will not catch it \
+             for the first minute. Set FGM_IGNORE_LOAD=1 to proceed anyway. ***\n",
+            sibs.len()
+        );
+        if std::env::var_os("FGM_IGNORE_LOAD").is_none() {
+            std::process::exit(3);
+        }
+    }
+    let one = loadavg();
     let ncpu = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(4) as f64;
     if one > ncpu * 0.35 {
         eprintln!(
@@ -29,6 +80,29 @@ fn check_load() {
         if std::env::var_os("FGM_IGNORE_LOAD").is_none() {
             std::process::exit(3);
         }
+    }
+    one
+}
+
+/// Re-check after the run. Contention that *starts* mid-run is invisible to any
+/// check made before it, and that is precisely the case that produced a
+/// published-looking 2x error. Loud on stdout, so it lands in the same log as
+/// the numbers it invalidates rather than in a stderr stream nobody kept.
+fn verify_clean(start_load: f64) {
+    let sibs = sibling_benches();
+    let end = loadavg();
+    let ncpu = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(4) as f64;
+    if !sibs.is_empty() {
+        println!(
+            "\n*** NUMBERS ABOVE ARE SUSPECT: {} other fgm-bench process(es) appeared \
+             during this run ({sibs:?}). Discard and re-measure. ***",
+            sibs.len()
+        );
+    } else if end > ncpu * 0.9 && end > start_load * 1.5 {
+        println!(
+            "\n*** NUMBERS ABOVE MAY BE SUSPECT: load average rose {start_load:.2} -> {end:.2} \
+             on {ncpu:.0} cores during this run. ***"
+        );
     }
 }
 
@@ -119,7 +193,7 @@ fn main() {
     let mode = args.get(1).map(String::as_str).unwrap_or("sweep");
     let path = args.get(2).map(String::as_str).unwrap_or("/home/user/models/g4e2b.fgm");
 
-    check_load();
+    let start_load = check_load();
     let t0 = Instant::now();
     let model = Model::open(path).expect("open model");
     let cfg = model.cfg.clone();
@@ -813,4 +887,5 @@ fn main() {
             std::process::exit(2);
         }
     }
+    verify_clean(start_load);
 }
