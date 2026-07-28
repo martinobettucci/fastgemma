@@ -89,6 +89,41 @@ impl KvCache {
         KvCache { layers, len: 0, max_len }
     }
 
+    /// Copy `src`'s populated state into `self`, so this sequence continues
+    /// from a prefix that was prefilled once and shared by every request.
+    ///
+    /// This is the whole prefix-sharing mechanism. In the target profile the
+    /// 12-tool system prompt is identical across the 8 concurrent requests, so
+    /// re-prefilling it per sequence is pure waste: at a 2048-token shared
+    /// prefix the 8 sequences drop from 65536 prefill tokens to 51200, 22%
+    /// less. The fork itself is a memcpy of ~35 MB/seq, which measures in
+    /// milliseconds against tens of seconds of avoided prefill.
+    ///
+    /// Both caches must come from the same `Config` and the same `max_batch`,
+    /// so slot mapping (`pos % capacity`) is identical on both sides and the
+    /// copy needs no remapping. A ring layer that has already wrapped holds
+    /// live data at every slot, so it is copied whole; otherwise only the
+    /// `len` slots actually written are copied.
+    pub fn fork_from(&mut self, src: &KvCache) {
+        assert_eq!(self.layers.len(), src.layers.len(), "fork across configs");
+        assert!(src.len <= self.max_len, "prefix longer than this cache");
+        for (dst, s) in self.layers.iter_mut().zip(src.layers.iter()) {
+            let (dst, s) = match (dst, s) {
+                (Some(d), Some(s)) => (d, s),
+                (None, None) => continue,
+                _ => panic!("fork across configs: layer storage differs"),
+            };
+            assert_eq!(dst.capacity, s.capacity, "fork across cache geometries");
+            let slots = if s.ring && src.len >= s.capacity { s.capacity } else { src.len };
+            let row = s.row_len();
+            dst.k[..slots * row].copy_from_slice(&s.k[..slots * row]);
+            dst.v[..slots * row].copy_from_slice(&s.v[..slots * row]);
+            dst.ks[..slots].copy_from_slice(&s.ks[..slots]);
+            dst.vs[..slots].copy_from_slice(&s.vs[..slots]);
+        }
+        self.len = src.len;
+    }
+
     pub fn bytes(&self) -> usize {
         self.layers
             .iter()

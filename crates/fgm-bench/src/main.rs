@@ -214,7 +214,10 @@ fn main() {
         // Tool-call exactness: compile 12 tools x 4 params into a token-level
         // constraint and decode under it, checking every emitted call parses.
         "tools" => {
-            use fgm_core::grammar::{load_vocab_bytes, synthetic_tools, Constraint, GrammarBuilder};
+            use fgm_core::grammar::{
+                load_vocab_bytes, parse_call, render, synthetic_tools, Constraint, Delims,
+                GrammarBuilder,
+            };
             let ntools: usize = std::env::var("FGM_TOOLS").ok().and_then(|v| v.parse().ok()).unwrap_or(12);
             let nparams: usize = std::env::var("FGM_PARAMS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
             let tokjson = args.get(3).map(String::as_str)
@@ -236,20 +239,42 @@ fn main() {
 
             // Walk the grammar greedily by always taking the lowest legal token,
             // which is enough to exercise every state and measure forcing.
+            // Every tool must be spellable, not just the first. The previous
+            // builder gave each tool its own chain from the start state, so
+            // stepping always took the first edge and 11 of 12 tools were
+            // unreachable -- a walk that emits one valid call cannot see that,
+            // so check the whole set explicitly.
+            let mut reachable = 0usize;
+            for t in &tools {
+                let mut st = c.start();
+                let mut ok = c.peek_tok(st, Delims::GEMMA4.call_open).map(|n| st = n).is_some();
+                if ok {
+                    for b in format!("call:{}{{", t.name).bytes() {
+                        match c.peek(st, b) { Some(n) => st = n, None => { ok = false; break; } }
+                    }
+                }
+                if ok { reachable += 1; } else { println!("  UNREACHABLE TOOL: {}", t.name); }
+            }
+            println!("  tools reachable from the start state: {reachable}/{}", tools.len());
+            assert_eq!(reachable, tools.len(), "grammar cannot spell every tool");
+
             c.reset();
             let mut steps = 0usize;
             let mut forced = 0usize;
-            let mut out: Vec<u8> = Vec::new();
+            let mut ids: Vec<u32> = Vec::new();
             while !c.done() && steps < 4096 {
                 let n = c.count();
                 if n == 0 { println!("  DEAD END at step {steps}"); break; }
                 if n == 1 { forced += 1; }
                 // Prefer a token that leaves the current DFA state, so the walk
                 // makes progress instead of looping inside a string body forever.
+                // Delimiter tokens carry no bytes and always advance, so they are
+                // taken as soon as they are legal.
                 let mut pick = usize::MAX;
                 let mut fallback = usize::MAX;
                 for t in 0..vocab.len() {
-                    if vocab[t].is_empty() || !c.allowed(t) { continue; }
+                    if !c.allowed(t) { continue; }
+                    if vocab[t].is_empty() { pick = t; break; }
                     if fallback == usize::MAX { fallback = t; }
                     let before = c.state;
                     let mut probe = c.state;
@@ -261,24 +286,26 @@ fn main() {
                 }
                 if pick == usize::MAX { pick = fallback; }
                 if pick == usize::MAX { println!("  no legal token at step {steps}"); break; }
-                out.extend_from_slice(&vocab[pick]);
+                ids.push(pick as u32);
                 if !c.advance(pick) { println!("  advance failed at step {steps}"); break; }
                 steps += 1;
             }
-            let text = String::from_utf8_lossy(&out).to_string();
+            let text = render(&ids, &vocab, Delims::GEMMA4);
             println!("  walked {steps} steps, grammar {} ", if c.done() { "ACCEPTED" } else { "did not accept" });
             println!("  forced steps (mask admits exactly 1 token): {forced}/{steps} = {:.0}%",
                      100.0 * forced as f64 / steps.max(1) as f64);
             println!("  -> those steps can skip the 201 MB int4 LM-head read entirely");
-            println!("  emitted: {}", &text[..text.len().min(160)]);
-            match serde_json::from_str::<serde_json::Value>(&text) {
-                Ok(v) => {
-                    println!("  emitted text PARSES as JSON: true");
-                    let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("?");
-                    let nargs = v.get("arguments").and_then(|x| x.as_object()).map(|o| o.len()).unwrap_or(0);
-                    println!("  -> tool={name} args={nargs} (expected {nparams})");
+            println!("  emitted: {}", &text[..text.len().min(200)]);
+            match parse_call(&text) {
+                Some(call) => {
+                    println!("  emitted text parses as a Gemma 4 tool call: true");
+                    println!("  -> tool={} args={} (expected {nparams})", call.name, call.args.len());
+                    assert_eq!(call.args.len(), nparams, "wrong argument count");
                 }
-                Err(e) => println!("  emitted text PARSES as JSON: false ({e})"),
+                None => {
+                    println!("  emitted text parses as a Gemma 4 tool call: FALSE");
+                    std::process::exit(4);
+                }
             }
         }
 
@@ -420,15 +447,18 @@ fn main() {
 
             let t0 = Instant::now();
             let mut off = 0;
+            let mut tok = 0u32;
             while off < toks.len() {
                 let n = chunk.min(toks.len() - off);
-                r.forward(&toks[off..off + n], off, &mut caches[0]);
+                // the last chunk's final row already carries the first sampled
+                // token's logits; re-forwarding that row would only rewrite the
+                // KV slot it just wrote
+                tok = argmax(r.forward(&toks[off..off + n], off, &mut caches[0])) as u32;
                 off += n;
             }
             let ttft = t0.elapsed().as_secs_f64();
 
             let mut out = Vec::with_capacity(ngen);
-            let mut tok = argmax(r.forward(&toks[toks.len() - 1..], toks.len() - 1, &mut caches[0])) as u32;
             let mut pos = toks.len();
             for _ in 0..ngen {
                 if eos.contains(&tok) { break; }
@@ -441,6 +471,75 @@ fn main() {
                       toks.len(), ttft, out.len(), el - ttft,
                       out.len() as f64 / (el - ttft).max(1e-9));
             println!("{}", out.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","));
+        }
+
+        // Prefix sharing. The target profile is 8 concurrent requests that all
+        // carry the same 12-tool system prompt, so the shared span is prefilled
+        // once and forked into every sequence's cache. Measures both paths and
+        // checks the forked path produces bit-identical logits -- the fork is a
+        // copy, not a recomputation, so nothing about float evaluation order
+        // changes and bit-identity is the right check here.
+        "share" => {
+            let conc: usize = std::env::var("FGM_CONC").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+            let pre: usize = std::env::var("FGM_PREFIX").ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
+            let suf: usize = std::env::var("FGM_SUFFIX").ok().and_then(|v| v.parse().ok()).unwrap_or(6144);
+            let chunk: usize = std::env::var("FGM_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+            let ctx = pre + suf + 8;
+            println!("\n== prefix sharing: {conc} seq, {pre} shared + {suf} unique, chunk {chunk} ==");
+
+            let mut r = Runner::new(&model, chunk.max(conc), ctx, threads());
+            let shared = synth_tokens(pre, 7);
+            let tails: Vec<Vec<u32>> = (0..conc).map(|i| synth_tokens(suf, 100 + i as u64)).collect();
+
+            let mut prefill = |r: &mut Runner, c: &mut KvCache, t: &[u32], base: usize| -> u32 {
+                let mut off = 0;
+                let mut last = 0u32;
+                while off < t.len() {
+                    let n = chunk.min(t.len() - off);
+                    last = argmax(r.forward(&t[off..off + n], base + off, c)) as u32;
+                    off += n;
+                }
+                last
+            };
+
+            // A: every sequence prefills the whole prompt itself
+            let mut caches: Vec<KvCache> = (0..conc).map(|_| KvCache::new(&cfg, ctx, chunk)).collect();
+            let t = Instant::now();
+            let mut base_tok = Vec::with_capacity(conc);
+            for s in 0..conc {
+                prefill(&mut r, &mut caches[s], &shared, 0);
+                base_tok.push(prefill(&mut r, &mut caches[s], &tails[s], pre));
+            }
+            let ta = t.elapsed().as_secs_f64();
+            println!("  no sharing: {} tok in {:.2}s -> {:.1} tok/s",
+                     conc * (pre + suf), ta, (conc * (pre + suf)) as f64 / ta);
+
+            // B: prefill the shared span once, fork it, then the unique tails
+            let mut caches: Vec<KvCache> = (0..conc).map(|_| KvCache::new(&cfg, ctx, chunk)).collect();
+            let t = Instant::now();
+            prefill(&mut r, &mut caches[0], &shared, 0);
+            let t_pre = t.elapsed().as_secs_f64();
+            let t_fork = Instant::now();
+            let (head, tail) = caches.split_at_mut(1);
+            for c in tail.iter_mut() {
+                c.fork_from(&head[0]);
+            }
+            let tf = t_fork.elapsed().as_secs_f64();
+            let mut share_tok = Vec::with_capacity(conc);
+            for s in 0..conc {
+                share_tok.push(prefill(&mut r, &mut caches[s], &tails[s], pre));
+            }
+            let tb = t.elapsed().as_secs_f64();
+            println!("  sharing:    {} tok in {:.2}s -> {:.1} tok/s effective \
+                     ({:.2}s shared prefill + {:.0}ms fork of {:.0} MB + {:.2}s tails)",
+                     conc * (pre + suf), tb, (conc * (pre + suf)) as f64 / tb,
+                     t_pre, tf * 1000.0,
+                     (conc - 1) as f64 * caches[0].bytes() as f64 / 1e6, tb - t_pre - tf);
+            println!("  speedup {:.2}x, {} prefill tokens avoided",
+                     ta / tb, (conc - 1) * pre);
+            let agree = base_tok.iter().zip(&share_tok).filter(|(a, b)| a == b).count();
+            println!("  next-token identity after fork: {agree}/{conc}");
+            assert_eq!(agree, conc, "forked cache changed the result");
         }
 
         m => {
