@@ -825,3 +825,58 @@ and A tile-packing, previously single-threaded while the GEMM itself was not):
 Bit-exact against the serial path, since the work is per-row and the split
 preserves evaluation order — which is why bit-identity is a valid check *here*
 and not for anything that reorders float accumulation.
+
+---
+
+## 13. Re-review: which rejections were about precision, and which were not
+
+The acceptance bar changed. It used to be greedy agreement with HF logits; it is
+now behavioural — right tool, right arguments, right answer at 8k. That is the
+correct bar for this engine (we deliberately trade numerical precision for
+speed, so matching another implementation's numbers was never going to happen),
+but it also invalidates part of the reasoning behind earlier decisions. Going
+back through them, honestly, including the ones the change does *not* rescue.
+
+| idea | why it was shelved | does the new bar change it? |
+|---|---|---|
+| BF16 attention | bandwidth (KV is already int8, bf16 doubles it) and compute (AMX-BF16 is half AMX-INT8) | **No.** The objection was never precision. Still rejected. |
+| int8 P·V | "softmax probabilities quantise badly to int8" | **Yes — promote.** That was a precision objection and precision is no longer the bar. And the premise is weak anyway: after softmax the row max is exactly 1, so a per-row int8 scale is well conditioned. V is *already* int8, so P·V becomes an int8×int8 GEMM eligible for AMX at 14.69 TOPS instead of an AVX-512 f32 weighted sum. |
+| int4 group 512 | +3.6% weight error for +38% GEMM TOPS (3.02 vs 2.19), judged on error | **Yes — measure.** Convert at g512 and run the behavioural eval. If tool exactness and 8k retention hold, 38% on the dominant cost is the cheapest win on the board. |
+| int4 KV cache | not attempted; precision | **Yes, conditionally.** Halves KV bytes. Worth it only if the profile says KV traffic is material — gate on measurement, not on appetite. |
+| drop the Hadamard rotation | costs int4 error (0.078 → 0.194 on outlier weights) | **Yes — worth an A/B, expected to fail.** Saves an FWHT per GEMM. I expect the behavioural eval to reject it, which is a useful result: it would show the bar has teeth rather than rubber-stamping every approximation. |
+| sparse attention | approximation was off the table | **Yes — see below.** |
+| cheaper `exp` | Cephes range reduction is exact-ish and was never questioned | **Yes, conditionally.** Only worth it if softmax is a real share of attention time. |
+| MTP | queued behind base performance, per the brief | **No.** Still last. |
+
+### Sparse attention: which kinds are admissible, and why the retention test decides
+
+28 of 35 layers are already sliding-window 512 — sparse in the strongest sense.
+Only the **7 full-attention layers** scale with context, so they are the entire
+target.
+
+- **StreamingLLM (sinks + local window)** keeps the first few tokens and the
+  last W, discarding the middle. It would fail the retention test at mid depths
+  by construction. Reject — and note that this is exactly why the retention test
+  sweeps depth instead of testing recall once.
+- **H2O / heavy-hitter eviction** drops positions whose accumulated attention
+  mass is low. Evicted means gone: a fact the query has not yet asked about can
+  be evicted before it is needed. Same failure mode, less predictable.
+- **Quest-style block top-k** is different in kind. Partition KV into blocks,
+  keep per-block elementwise min/max of K, upper-bound each block's best score
+  from the query, and attend only to the top blocks. Nothing is evicted — the
+  whole cache stays addressable, so a planted fact at any depth remains
+  *selectable* whenever the query actually attends to it. That is precisely the
+  property the retention test measures, which makes it the one sparse scheme
+  whose approximation is aligned with the acceptance criterion rather than at war
+  with it.
+
+Estimated ceiling before measuring, so the measurement can contradict it: a
+first-principles MAC count puts full-attention layers at ~8.7% of prefill at
+8192 and sliding layers at ~2.2%, so block top-k caps out around a 7% prefill
+gain at 8192 and much less below. But prefill throughput measured 188 → 98.6
+tok/s from 1024 to 8192, a 48% collapse that ~11% of attention cannot explain.
+Either the attention kernel runs far below the f32 FMA rate I assumed, or
+something else scales with context. **Profile first.** Picking an exotic
+attention before knowing which of those is true would be the same mistake as the
+1924 GB estimate in §12 — a number that is arithmetically correct and about the
+wrong machine.

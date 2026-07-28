@@ -88,6 +88,51 @@ impl<'a> DualW<'a> {
     }
 }
 
+/// When to use the blocked attention path instead of the per-(row, head) one.
+///
+/// This is deliberately a *shape* policy rather than a switch. The two paths
+/// have opposite scaling: blocking amortises a K/V block across a set of query
+/// rows, so it needs rows to pay off, while the per-head path gets its
+/// parallelism from (row, head) pairs and its cache residency for free as long
+/// as the K set fits in L2. Which of those dominates depends on both the row
+/// count and the context length, so a single global answer is wrong at one end
+/// or the other by construction.
+///
+/// Defaults are filled in from the measured table in `bench/ab_blocked.sh`;
+/// `FGM_BLOCKED=<min_m>:<max_ctx>` overrides for A/B (`0:0` disables).
+#[derive(Clone, Copy, Debug)]
+pub struct AttnPolicy {
+    /// blocked needs at least this many query rows
+    pub min_m: usize,
+    /// ...and a context no longer than this (0 disables blocking entirely)
+    pub max_ctx: usize,
+}
+
+impl AttnPolicy {
+    pub fn from_env() -> Self {
+        // Measured: blocking loses at 1024 (-8.8%), 2048 (-12.0%), 4096 (-8.4%)
+        // and 8192 (-7.1%). Whether it wins *below* 1024 is a separate question
+        // with a separate answer -- short contexts are where a K/V block is
+        // small enough that blocking's extra bookkeeping might be repaid.
+        // Default stays off until that end of the curve is measured; see
+        // `bench/ab_blocked.sh`.
+        let (mut min_m, mut max_ctx) = (16usize, 0usize);
+        if let Ok(v) = std::env::var("FGM_BLOCKED") {
+            let mut it = v.split(':');
+            min_m = it.next().and_then(|x| x.parse().ok()).unwrap_or(16);
+            max_ctx = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+        } else if std::env::var_os("FGM_BLOCKED_ATTN").is_some() {
+            max_ctx = usize::MAX;
+        }
+        AttnPolicy { min_m, max_ctx }
+    }
+
+    #[inline]
+    pub fn blocked(&self, m: usize, ctx: usize) -> bool {
+        self.max_ctx > 0 && m >= self.min_m && ctx <= self.max_ctx
+    }
+}
+
 /// Weights for one decoder layer, resolved once at construction.
 pub struct LayerW<'m> {
     pub input_ln: &'m [f32],
@@ -197,9 +242,8 @@ pub struct Runner<'m> {
     rows: Vec<RowRef>,
     /// same rows in the blocked kernel's C layout
     fa: Vec<FaRow>,
-    /// FGM_BLOCKED_ATTN=1 opts into the blocked path (off by default; see the
-    /// gate in `forward_multi` for the measurements that put it there)
-    blocked_attn: bool,
+    /// shape-conditional choice of attention path
+    pub attn: AttnPolicy,
     /// which of a dual-format weight's two quantisations each GEMM uses
     pub wsel: WeightSel,
     /// Per-phase seconds, accumulated when FGM_PROFILE is set.
@@ -348,7 +392,7 @@ impl<'m> Runner<'m> {
                 };
                 m
             ],
-            blocked_attn: std::env::var_os("FGM_BLOCKED_ATTN").is_some(),
+            attn: AttnPolicy::from_env(),
             wsel: WeightSel::from_env(),
             prof: [0.0; NPHASE],
             profiling: std::env::var_os("FGM_PROFILE").is_some(),
@@ -553,25 +597,16 @@ impl<'m> Runner<'m> {
                     pos: pos[r] as i32,
                 };
             }
-            // Blocked attention is OFF by default: measured, it loses at every
-            // context we serve (-8.8% at 1024, -12.0% at 2048, -8.4% at 4096).
-            // The premise was wrong, not the implementation. Blocking exists to
-            // keep re-read K/V in cache, but with 1 KV head the int8 K set is
-            // only 0.5 MB at 2k and 2 MB at 8k, so it is already L2-resident on
-            // the per-head path -- there was no DRAM traffic to save, and the
-            // online-softmax rescaling per block is pure added cost.
+            // Which attention path to run is a *shape* decision, not a global
+            // one. See `AttnPolicy` for the measured table behind the default.
             //
-            // Kept behind FGM_BLOCKED_ATTN=1 rather than deleted, because it is
-            // the path that wins once K/V genuinely exceeds L2 (much longer
-            // context, or more KV heads as in E4B), and re-deriving it later is
-            // more expensive than carrying it.
-            //
-            // It is only *correct* when every row in a block reads the same
-            // cache, because the block shares one K view. That holds for chunked
+            // It is only *correct* to block when every row reads the same cache,
+            // because the block shares one K view. That holds for chunked
             // prefill (one sequence at a time) but not for batched decode, where
             // each row is a different sequence.
             let same_cache = seq[..m].iter().all(|&x| x == seq[0]);
-            let blocked = m >= 16 && same_cache && self.blocked_attn;
+            let ctx = pos[..m].iter().copied().max().unwrap_or(0) + 1;
+            let blocked = same_cache && self.attn.blocked(m, ctx);
             self.pool.attn(AttnJob {
                 out: b.ao.as_mut_ptr(),
                 q: b.q.as_ptr(),

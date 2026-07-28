@@ -69,7 +69,9 @@ def main():
         # question and framing are outside the filler budget
         question = f"Using the notes above, what is the {label}? Answer with the code only."
         head = fmt.enc("system\n" + SYSTEM)
-        tail = fmt.enc("user\n") + fmt.enc(question)
+        # one encode, not two: the tokenizer merges across a boundary,
+        # so encoding the pieces separately is not the same token stream
+        tail = fmt.enc("user\n" + question)
         budget = a.ctx - len(head) - len(tail) - len(fact_ids) - 16
         assert budget > 0, "context too small for the framing"
         reps = budget // len(filler_ids) + 1

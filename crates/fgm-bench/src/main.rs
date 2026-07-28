@@ -82,6 +82,28 @@ fn load_toolspec(path: &str) -> Vec<fgm_core::grammar::Tool> {
         .collect()
 }
 
+/// Print and reset the per-phase timers. Called per shape so the breakdown is
+/// attributable: "attention is 11% of prefill" is meaningless without saying at
+/// which context, since that is the only share that moves.
+fn prof_line(r: &mut Runner, label: &str) {
+    if std::env::var_os("FGM_PROFILE").is_none() {
+        return;
+    }
+    let tot: f64 = r.prof.iter().sum();
+    if tot < 1e-6 {
+        return;
+    }
+    let mut idx: Vec<usize> = (0..NPHASE).collect();
+    idx.sort_by(|&a, &b| r.prof[b].total_cmp(&r.prof[a]));
+    let parts: Vec<String> = idx
+        .iter()
+        .filter(|&&i| r.prof[i] / tot > 0.005)
+        .map(|&i| format!("{} {:.1}%", PHASE_NAMES[i], 100.0 * r.prof[i] / tot))
+        .collect();
+    println!("      [{label}] {:.2}s: {}", tot, parts.join(", "));
+    r.prof = [0.0; NPHASE];
+}
+
 fn argmax(v: &[f32]) -> usize {
     let mut best = (0usize, f32::NEG_INFINITY);
     for (i, &x) in v.iter().enumerate() {
@@ -459,6 +481,7 @@ fn main() {
                 let el = t.elapsed().as_secs_f64();
                 let tot = (conc * pp) as f64;
                 println!("  {:>7} {:>9.2}s {:>12.1} {:>10.3}", pp, el, tot / el, el * 1000.0 / tot);
+                prof_line(&mut r, &format!("prefill {pp}"));
             }
 
             println!("\n-- decode after an {maxpp}-token prompt (aggregate over {conc}) --");
@@ -480,6 +503,7 @@ fn main() {
             let seq: Vec<usize> = (0..conc).collect();
             let rows: Vec<usize> = (0..conc).collect();
             let mut done = 0usize;
+            r.prof = [0.0; NPHASE];
             let t0 = Instant::now();
             for &tg in &tgs {
                 while done < tg {
@@ -494,6 +518,7 @@ fn main() {
                 let tot = (done * conc) as f64;
                 println!("  {:>7} {:>9.2}s {:>12.1} {:>12.1} {:>10.1}",
                          tg, el, tot / el, done as f64 / el, el * 1000.0 / done as f64);
+                prof_line(&mut r, &format!("decode {tg} @ctx {maxpp}"));
             }
             println!("  kv {:.0} MB total ({:.1} MB/seq at {} ctx)",
                      caches.iter().map(|c| c.bytes()).sum::<usize>() as f64 / 1e6,
@@ -543,6 +568,71 @@ fn main() {
                       toks.len(), ttft, out.len(), el - ttft,
                       out.len() as f64 / (el - ttft).max(1e-9));
             println!("{}", out.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","));
+        }
+
+        // Full (prompt x output) matrix. `curve` measures decode only after the
+        // longest prompt, which hides that decode cost depends on the context it
+        // decodes from. Every cell here is measured: prefill at `pp`, then
+        // decode with checkpoints at each `tg`, so a cell is a real end-to-end
+        // request of that shape rather than two numbers added together.
+        //
+        // This is what a shape-conditional policy has to be fitted against.
+        "matrix" => {
+            let conc: usize = std::env::var("FGM_CONC").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+            let chunk: usize = std::env::var("FGM_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+            let pps: Vec<usize> = std::env::var("FGM_PP").ok()
+                .map(|v| v.split(',').map(|x| x.parse().unwrap()).collect())
+                .unwrap_or_else(|| vec![128, 256, 512, 1024, 2048, 4096, 8192]);
+            let tgs: Vec<usize> = std::env::var("FGM_TG").ok()
+                .map(|v| v.split(',').map(|x| x.parse().unwrap()).collect())
+                .unwrap_or_else(|| vec![128, 512, 2048]);
+            let maxtg = *tgs.iter().max().unwrap();
+            let ctx = *pps.iter().max().unwrap() + maxtg + 8;
+            let mut r = Runner::new(&model, chunk.max(conc), ctx, threads());
+            println!("\n== (prompt x output) matrix, concurrency {conc}, chunk {chunk} ==");
+            println!("  attn {:?}  weights {:?}", r.attn, r.wsel);
+            println!("  {:>7} {:>7} {:>9} {:>9} {:>10} {:>10} {:>10}",
+                     "in", "out", "ttft_s", "gen_s", "pp_tok/s", "tg_tok/s", "req_tok/s");
+            for &pp in &pps {
+                let mut caches: Vec<KvCache> =
+                    (0..conc).map(|_| KvCache::new(&cfg, pp + maxtg + 8, chunk)).collect();
+                let prompts: Vec<Vec<u32>> =
+                    (0..conc).map(|i| synth_tokens(pp, 100 + i as u64)).collect();
+                let t = Instant::now();
+                for s in 0..conc {
+                    let mut off = 0;
+                    while off < pp {
+                        let n = chunk.min(pp - off);
+                        r.forward(&prompts[s][off..off + n], off, &mut caches[s]);
+                        off += n;
+                    }
+                }
+                let ttft = t.elapsed().as_secs_f64();
+                prof_line(&mut r, &format!("prefill {pp}"));
+
+                let mut toks: Vec<u32> = (0..conc).map(|i| 1000 + i as u32).collect();
+                let seq: Vec<usize> = (0..conc).collect();
+                let rows: Vec<usize> = (0..conc).collect();
+                let mut done = 0usize;
+                let t0 = Instant::now();
+                for &tg in &tgs {
+                    while done < tg {
+                        let pos: Vec<usize> = vec![pp + done; conc];
+                        let lg = r.forward_multi(&toks, &seq, &pos, &mut caches, &rows);
+                        for s in 0..conc {
+                            toks[s] = argmax(&lg[s * cfg.vocab_size..(s + 1) * cfg.vocab_size]) as u32;
+                        }
+                        done += 1;
+                    }
+                    let gen = t0.elapsed().as_secs_f64();
+                    println!("  {:>7} {:>7} {:>9.2} {:>9.2} {:>10.1} {:>10.1} {:>10.1}",
+                             pp, tg, ttft, gen,
+                             (conc * pp) as f64 / ttft,
+                             (conc * done) as f64 / gen,
+                             (conc * (pp + done)) as f64 / (ttft + gen));
+                    prof_line(&mut r, &format!("decode {tg} @ctx {pp}"));
+                }
+            }
         }
 
         // Batched generation for the behavioural eval: one prompt per input
