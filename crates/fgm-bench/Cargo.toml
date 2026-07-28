@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 fgm-core = { path = "../fgm-core" }
 fgm-kernels = { path = "../fgm-kernels" }
+serde_json = "1"

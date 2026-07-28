@@ -25,6 +25,27 @@ fn synth_tokens(n: usize, seed: u64) -> Vec<u32> {
         .collect()
 }
 
+/// Minimal structural JSON check, so the bench does not need a JSON dependency.
+fn serde_json_check(s: &str) -> bool {
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut prev_esc = false;
+    for ch in s.chars() {
+        if in_str {
+            if prev_esc { prev_esc = false; continue; }
+            match ch { '\\' => prev_esc = true, '"' => in_str = false, _ => {} }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => { depth -= 1; if depth < 0 { return false; } }
+            _ => {}
+        }
+    }
+    depth == 0 && !in_str
+}
+
 fn argmax(v: &[f32]) -> usize {
     let mut best = (0usize, f32::NEG_INFINITY);
     for (i, &x) in v.iter().enumerate() {
@@ -185,6 +206,77 @@ fn main() {
             if steps < pout {
                 println!("  (decode capped at 60s: {steps}/{pout} steps; extrapolated full request \
 {:.0}s)", pre + dec / steps as f64 * pout as f64);
+            }
+        }
+
+        // Tool-call exactness: compile 12 tools x 4 params into a token-level
+        // constraint and decode under it, checking every emitted call parses.
+        "tools" => {
+            use fgm_core::grammar::{load_vocab_bytes, synthetic_tools, Constraint, GrammarBuilder};
+            let ntools: usize = std::env::var("FGM_TOOLS").ok().and_then(|v| v.parse().ok()).unwrap_or(12);
+            let nparams: usize = std::env::var("FGM_PARAMS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+            let tokjson = args.get(3).map(String::as_str)
+                .unwrap_or("/home/user/models/g4e2b/tokenizer.json");
+
+            let t = Instant::now();
+            let vocab = load_vocab_bytes(&std::fs::read_to_string(tokjson).expect("tokenizer.json"));
+            println!("\n== constrained tool calling: {ntools} tools x {nparams} params ==");
+            println!("  vocab {} tokens loaded in {:?}", vocab.len(), t.elapsed());
+
+            let tools = synthetic_tools(ntools, nparams);
+            let t = Instant::now();
+            let dfa = GrammarBuilder::build(&tools);
+            let mut c = Constraint::compile(dfa, &vocab);
+            let build = t.elapsed();
+            println!("  DFA {} states, compiled to token masks in {:?}", c.num_states(), build);
+            println!("  mask memory {:.1} MB",
+                     (c.num_states() * vocab.len().div_ceil(64) * 8) as f64 / 1e6);
+
+            // Walk the grammar greedily by always taking the lowest legal token,
+            // which is enough to exercise every state and measure forcing.
+            c.reset();
+            let mut steps = 0usize;
+            let mut forced = 0usize;
+            let mut out: Vec<u8> = Vec::new();
+            while !c.done() && steps < 4096 {
+                let n = c.count();
+                if n == 0 { println!("  DEAD END at step {steps}"); break; }
+                if n == 1 { forced += 1; }
+                // Prefer a token that leaves the current DFA state, so the walk
+                // makes progress instead of looping inside a string body forever.
+                let mut pick = usize::MAX;
+                let mut fallback = usize::MAX;
+                for t in 0..vocab.len() {
+                    if vocab[t].is_empty() || !c.allowed(t) { continue; }
+                    if fallback == usize::MAX { fallback = t; }
+                    let before = c.state;
+                    let mut probe = c.state;
+                    let mut ok = true;
+                    for &b in &vocab[t] {
+                        match c.peek(probe, b) { Some(n) => probe = n, None => { ok = false; break; } }
+                    }
+                    if ok && probe != before { pick = t; break; }
+                }
+                if pick == usize::MAX { pick = fallback; }
+                if pick == usize::MAX { println!("  no legal token at step {steps}"); break; }
+                out.extend_from_slice(&vocab[pick]);
+                if !c.advance(pick) { println!("  advance failed at step {steps}"); break; }
+                steps += 1;
+            }
+            let text = String::from_utf8_lossy(&out).to_string();
+            println!("  walked {steps} steps, grammar {} ", if c.done() { "ACCEPTED" } else { "did not accept" });
+            println!("  forced steps (mask admits exactly 1 token): {forced}/{steps} = {:.0}%",
+                     100.0 * forced as f64 / steps.max(1) as f64);
+            println!("  -> those steps can skip the 201 MB int4 LM-head read entirely");
+            println!("  emitted: {}", &text[..text.len().min(160)]);
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(v) => {
+                    println!("  emitted text PARSES as JSON: true");
+                    let name = v.get("name").and_then(|x| x.as_str()).unwrap_or("?");
+                    let nargs = v.get("arguments").and_then(|x| x.as_object()).map(|o| o.len()).unwrap_or(0);
+                    println!("  -> tool={name} args={nargs} (expected {nparams})");
+                }
+                Err(e) => println!("  emitted text PARSES as JSON: false ({e})"),
             }
         }
 

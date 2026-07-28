@@ -1,4 +1,5 @@
 pub mod forward;
+pub mod grammar;
 pub mod kv;
 pub mod model;
 pub mod pool;
