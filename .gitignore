@@ -67,3 +67,11 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# bench binaries (built from bench/*/*.c)
+bench/roofline/roofline
+bench/kernels/gemm_test
+bench/kernels/gemm_bench
+bench/kernels/dbg
+*.fgm
+__pycache__/
