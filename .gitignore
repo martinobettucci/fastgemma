@@ -72,7 +72,14 @@ Testing/
 bench/roofline/roofline
 bench/kernels/gemm_test
 bench/kernels/gemm_bench
+bench/kernels/attn_test
+bench/kernels/attn_bench
 bench/kernels/dbg
+
+# eval scratch: token-id files the harness regenerates on every run
+bench/eval/.prompts.txt
+bench/eval/.retention.txt
+bench/eval/.retention.json
 *.fgm
 __pycache__/
 target/
