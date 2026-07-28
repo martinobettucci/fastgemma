@@ -408,6 +408,76 @@ comparison is worth running.
 
 ---
 
+## 8. The non-determinism was a platform defect: AMX tile state is lost on context switch
+
+The intermittent wrong answers were not a bug in this code. Chain of evidence:
+
+1. **The GEMM kernels are bit-stable in isolation** — 30 repeats of an identical
+   q4g/q8c call, byte-identical output, at every batch size that failed
+   end-to-end. So the arithmetic is fine.
+2. **Under CPU contention they fail every time** — same test, 6 competing
+   spinners: 25/25 q4g mismatches, 25/25 q8c, 15/15 at M=1200. Quiet: 1/25.
+3. **A minimal probe with none of this project's code reproduces it.** Load a
+   known pattern into a tile with `_tile_loadd`, busy-wait, `_tile_stored`,
+   compare (`bench/platform/amx_tilestate.c`). The tile comes back **zeroed**.
+
+Corruption probability tracks how long the state is held, which is exactly the
+signature of losing it across a context switch:
+
+| hold | corrupted (400 trials, 6 spinners) |
+|---|---|
+| 0 | 0% |
+| 10 µs | 0.25% |
+| 100 µs | 3% |
+| 1 ms | 16% |
+| 10 ms | 89% |
+
+That implies a context switch roughly every ~7 ms, each of which resets the
+tile file to INIT. `XTILEDATA` permission is requested per thread
+(`arch_prctl(ARCH_REQ_XCOMP_PERM)`) and the probe still fails, so this is the
+kernel or the hypervisor not saving guest AMX state — not a missing opt-in.
+
+**Why every earlier test passed.** The kernel correctness sweeps run in
+milliseconds on an idle box; the end-to-end runs take minutes. The failures
+appeared exactly when the machine got busy, which is why the first sighting was
+"the engine is non-deterministic" rather than "the platform is broken".
+
+**Why it looked like an uninitialized read.** Corruption zeroes tiles, so a
+corrupted accumulator produces a *plausible smaller* number rather than garbage.
+It clustered by run and moved between layers, which is what sent me looking for
+stale buffers.
+
+### What this means for the project
+
+The AMX bet is sound — 14.69 TOPS vs 1.16 for VNNI is measured and real, and the
+kernels compute the right answer. But on *this* VM, any tile-resident
+accumulator held longer than a few hundred microseconds is at risk, and a full
+GEMM holds thousands of them. Under load the engine will be intermittently
+wrong.
+
+Mitigation options, in order of preference:
+
+1. **Sentinel row + per-block retry.** Configure accumulators with 16 rows but
+   use only 15 for data, seeding row 15 with a distinctive constant and keeping
+   the matching A row zeroed so nothing accumulates into it. After each block,
+   check row 15; if it is not the constant, the tile file was reset — redo the
+   block. Per-block windows are under a microsecond, so retries are rare and
+   cheap. Costs ~6% throughput (M-blocking 30 instead of 32).
+2. **Shrink the tile-resident window** by draining accumulators more often. Helps
+   probabilistically, does not eliminate.
+3. **Run on hardware that preserves XTILEDATA.** The right long-term answer, and
+   the reason the throughput numbers here remain meaningful.
+
+Until (1) lands, every accuracy number from this engine is provisional and every
+throughput number should be read as "correct arithmetic, on an idle box".
+
+Note this hits **any** AMX user on this VM, including llama.cpp built with
+`GGML_AMX_*`. Its default AVX512/AVX2 path is unaffected, so the baseline
+comparison is still valid — and it is the honest comparison anyway, since that
+is what llama.cpp actually ships.
+
+---
+
 ## 7. Constrained tool calling
 
 DFA over the tool schemas → per-state token bitset. On the real 262144-token
