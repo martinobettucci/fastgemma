@@ -1515,3 +1515,74 @@ Both failures produce output that is *shaped* like a result and that favours
 the side still reporting numbers — which was mine, both times. This belongs
 with the contamination traps rather than with ordinary bugs: the danger is not
 that it breaks, it is that it does not look broken.
+
+
+---
+
+## 24. What machine is this, and does a faster one change the AMX verdict?
+
+33 GB/s is slow for RAM, which invites the question of whether the AMX
+conclusion in §19 is really about attention or just about a bad box.
+
+**The box.** 4 cores of a Sapphire Rapids Xeon @ 2.1 GHz under KVM/Docker,
+16 GB RAM, one NUMA node. `lscpu` reports **L3 260 MiB (1 instance)** — that
+is the whole host socket's cache visible to us, so this is a large SPR part
+with four cores allocated to it. `dmidecode` returns nothing (virtualised, no
+DMI memory table).
+
+**So 33 GB/s is not the DIMMs' limit, it is our four cores' limit.** A full SPR
+socket has 8 channels of DDR5-4800 ≈ 300 GB/s. Per-core bandwidth is capped by
+memory-level parallelism — roughly 10–16 outstanding line fills — giving
+~8–20 GB/s per core, and four of those landing at 33 GB/s is exactly right. The
+roofline measures this with all four threads reading (`run_threads(bw_read_worker,
+…, NTHREADS)`), so it is an aggregate, not a single-core figure.
+
+### Does more memory bandwidth rescue AMX for attention? No — it hurts
+
+Both compute and bandwidth scale with core count, but compute scales *without a
+ceiling* while the memory channels stop at ~300 GB/s:
+
+| | per core | 4 cores (here) | ~56-core socket |
+|---|---|---|---|
+| VNNI compute | ~145 G MAC/s | 580 | ~8100 |
+| memory at 1 MAC/byte | ~8 G MAC/s | 33 | ~300 (channel-capped) |
+| compute : bandwidth | **18×** | **18×** | **27×** |
+
+Attention gets *more* starved on a bigger machine, not less. The verdict in §19
+generalises, and strengthens.
+
+The cache hierarchy agrees, measured against VNNI's 580 G MAC/s:
+
+| level | GB/s | = G MAC/s at 1 MAC/byte | % of VNNI |
+|---|---|---|---|
+| DRAM | 33 | 33 | 5.7% |
+| L3 | 58 | 58 | 10% |
+| L2 | 209 | 209 | 36% |
+| L1 | 393 | 393 | **68%** |
+
+Only an L1-resident K/V set would make attention compute-bound enough for AMX
+to matter, and an 8k KV set does not fit in 192 KB of L1. Even fully
+L2-resident attention is bandwidth-bound.
+
+### What a bigger machine does buy, and what actually fixes this
+
+A bigger machine buys **attention throughput scaling roughly linearly with
+cores** until the channels saturate — 32 cores might give 6–8× on the
+bandwidth-bound portion, which is 46% of prefill at 8192. That is a real and
+large win. It just does not come from AMX.
+
+**The lever that is neither RAM nor AMX: raise arithmetic intensity.** With MQA
+the 8 query heads share one KV head, so processing all 8 heads per K load gives
+**8 MACs per byte instead of 1**, moving the DRAM ceiling to ~264 G MAC/s (45%
+of VNNI) and the L2 ceiling well past it. The loop is currently head-outer, so
+K is re-streamed once per head. That is a loop-restructuring problem, not an
+instruction-set one.
+
+This is the same traffic argument blocked attention was built on. Blocking lost
+(§12) for reasons that had nothing to do with the traffic claim — an f32
+dequantisation blow-up, then online-softmax bookkeeping against a K set that was
+already L2-resident at the contexts tested. The traffic half was never the
+flawed part, and at 8k with 4 MB of K per full-attention layer it is no longer
+L2-resident. **Head-batched attention is the correct next optimisation**, and it
+is the one this analysis points to rather than anything involving tile
+registers.

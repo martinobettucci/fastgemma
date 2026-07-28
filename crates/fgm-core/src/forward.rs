@@ -199,6 +199,8 @@ pub struct Runner<'m> {
     rows: Vec<RowRef>,
     /// which of a dual-format weight's two quantisations each GEMM uses
     pub wsel: WeightSel,
+    /// FGM_KV4=1: simulate a 4-bit KV cache to measure its accuracy cost
+    kv4: bool,
     /// Per-phase seconds, accumulated when FGM_PROFILE is set.
     pub prof: [f64; NPHASE],
     profiling: bool,
@@ -336,6 +338,7 @@ impl<'m> Runner<'m> {
                 m
             ],
             wsel: WeightSel::from_env(),
+            kv4: std::env::var_os("FGM_KV4").is_some(),
             prof: [0.0; NPHASE],
             profiling: std::env::var_os("FGM_PROFILE").is_some(),
         }
@@ -504,12 +507,32 @@ impl<'m> Runner<'m> {
                     let mut s1 = [0.0f32; 1];
                     k::quant_act(&b.kbuf[r * rl..(r + 1) * rl], 1, rl,
                                  &mut lk.k[slot * rl..(slot + 1) * rl], &mut s1);
+                    // FGM_KV4=1 simulates a 4-bit KV cache by collapsing the
+                    // int8 values onto 15 levels, keeping the same per-row
+                    // scale and the same fast paths. It moves no fewer bytes,
+                    // so it measures ONLY the accuracy cost -- which is the
+                    // half worth knowing first, because a real int4 cache is
+                    // nibble packing plus an unpack before every dpbusd, and
+                    // there is no point building that to find the answers are
+                    // wrong. The attention ceiling probe says we are
+                    // bandwidth-bound at 1 MAC/byte, so halving KV bytes is
+                    // the largest remaining lever -- if it survives the gate.
+                    if self.kv4 {
+                        for v in &mut lk.k[slot * rl..(slot + 1) * rl] {
+                            *v = ((*v as i32 * 7 + 64) / 127).clamp(-7, 7) as i8 * 18;
+                        }
+                    }
                     lk.ks[slot] = s1[0];
                     // V goes into the cache transposed, so P.V can reduce over
                     // positions with an integer dot product. Quantise into a
                     // scratch row first, then scatter.
                     k::quant_act(&b.vbuf[r * rl..(r + 1) * rl], 1, rl,
                                  &mut b.vrow[..rl], &mut s1);
+                    if self.kv4 {
+                        for v in &mut b.vrow[..rl] {
+                            *v = ((*v as i32 * 7 + 64) / 127).clamp(-7, 7) as i8 * 18;
+                        }
+                    }
                     k::store_v_t(&mut lk.v, &b.vrow[..rl], rl, slot);
                     lk.vs[slot] = s1[0];
                 }
