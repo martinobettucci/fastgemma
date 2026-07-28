@@ -28,8 +28,13 @@ for pass in 1 2; do
       | awk -v p=$pp '$1==p {printf "pp=%s tg=%s\n", $5, $6}'
     idle
     printf "pass%s pp=%s llama.cpp " "$pass" "$pp"
-    $LC -m "$GGUF" -p $pp -n 64 -t 4 -r 1 -o csv 2>/dev/null \
-      | awk -F, 'NR>1 {gsub(/"/,""); if ($0 ~ /pp/) pp=$(NF-1); if ($0 ~ /tg/) tg=$(NF-1)}
-                 END {printf "pp=%s tg=%s\n", pp, tg}'
+    # Parse the markdown table llama-bench prints by default. The -o csv path
+    # was tried first and its column layout did not match what I assumed, which
+    # produced four empty rows that looked like llama.cpp failing rather than
+    # like my parser failing.
+    $LC -m "$GGUF" -p $pp -n 64 -t 4 -r 1 2>/dev/null \
+      | awk -F'|' '/\| *pp[0-9]/ {gsub(/ /,"",$7); split($7,a,"±"); p=a[1]}
+                   /\| *tg[0-9]/ {gsub(/ /,"",$7); split($7,a,"±"); t=a[1]}
+                   END {printf "pp=%s tg=%s\n", p, t}'
   done
 done
