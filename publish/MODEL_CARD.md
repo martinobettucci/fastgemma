@@ -73,6 +73,11 @@ All figures on an idle machine, 4 threads. Single-sequence, median of 5 runs
 with the full range in brackets — the run-to-run noise floor on this box is
 4.7% on prefill and 4.4% on decode, so ranges are quoted rather than points.
 
+There is also an int4 **group-512** build (`g4e2b-g512.fgm`, 2.77 GB) giving
++7.6% prefill. It is shipped conditionally: unconstrained tool calling drops to
+24/25 on the eval below, while grammar-constrained decoding restores 25/25. Use
+it only when tool calls are constrained.
+
 **Prefill, tok/s** (int8 weights, selected automatically for ≥16 rows):
 
 | prompt | tok/s |
@@ -99,6 +104,53 @@ with the full range in brackets — the run-to-run noise floor on this box is
 
 Decode is measured over 352 steps and extrapolated to 2048; the rate is
 measured, the total is arithmetic.
+
+## vs llama.cpp
+
+Same box, 4 threads, same bit width: Google's own QAT Q4_0 GGUF (llama.cpp
+build 91f8c9c) against fastgemma's int4 group-256. Engines alternated within
+the run so platform drift is shared rather than landing on one side.
+
+| | fastgemma | llama.cpp | |
+|---|---|---|---|
+| prefill 512 | **208.5** [199.9–217.0] | 133.6 ± 13.3 | **+56%** |
+| prefill 2048 | **192.7** [184.9–200.5] | 114.1 ± 2.7 | **+69%** |
+| decode (tg64, batch 1) | 13.6 [11.6–14.5] | **14.9–16.9** | llama.cpp +10–24% |
+
+Three caveats that belong with these numbers, not under them:
+
+- **Decode favours llama.cpp single-stream.** At batch 1 decode is pure memory
+  bandwidth, AMX has nothing to amortise, and their Q4_0 kernels are very well
+  tuned. fastgemma's decode advantage appears only under batching — 46.8 tok/s
+  aggregate at concurrency 8 — and claiming a decode win without that qualifier
+  would be false.
+- **This is a speed comparison only.** llama.cpp runs a quantisation-aware
+  *trained* checkpoint; these weights are post-training quantised from bf16.
+  Different accuracy starting points, and no behavioural comparison between the
+  two engines exists. A throughput ratio does not license a claim about which
+  engine is better.
+- **Only fastgemma uses AMX**, and this reference host's tile-state corruption
+  rate drifts between runs — visible as the wider fastgemma spread. Ranges are
+  quoted for that reason.
+
+## Why AMX for GEMM but not for attention
+
+AMX INT8 is 12.7× AVX512-VNNI on this box (14.69 vs 1.16 TOPS), and the engine
+uses it for every weight GEMM. It is deliberately **not** used for attention,
+and the reason is arithmetic intensity rather than any property of the
+instruction:
+
+| | MACs per byte moved | binding ceiling |
+|---|---|---|
+| weight GEMM, 256-row prefill chunk | 256 | compute — AMX wins |
+| attention, 1 KV head | **1** | bandwidth — 33 G MAC/s (DRAM), 209 (L2) |
+
+Every K or V byte in attention feeds exactly one multiply-accumulate and is
+then done with, so N MACs require N bytes. Measured, the attention kernel runs
+at 18–41 G MAC/s — that is 3–7% of the VNNI ceiling it already has, i.e. the
+multiplier is 93–97% idle. Making an idle multiplier 12.7× faster buys nothing.
+A weight GEMM reuses each byte across all M rows, which is why the same
+instruction is transformative there.
 
 ## Accuracy
 
