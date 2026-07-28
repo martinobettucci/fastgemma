@@ -57,6 +57,7 @@ extern "C" {
         h0: i32, h1: i32, ring: i32, cap: i32,
     );
     fn fgm_store_v_t(vt: *mut i8, src: *const i8, n: i32, slot: i32);
+    fn fgm_set_scalar_wfill(on: i32);
 }
 
 static AMX: Once = Once::new();
@@ -249,6 +250,13 @@ pub fn attend_q8_heads(
 pub fn attend_scratch(cap: usize, head_dim: usize) -> usize {
     // scores, two u8 weight planes, two int32 accumulator sets
     cap + cap.div_ceil(2) + 2 * head_dim + 64
+}
+
+/// Force the scalar P.V weight fill, for A/B against the vectorised one inside
+/// a single measurement window. Comparing across runs does not work here: the
+/// platform's AMX corruption rate drifts run to run and swamps the effect.
+pub fn set_scalar_wfill(on: bool) {
+    unsafe { fgm_set_scalar_wfill(i32::from(on)) }
 }
 
 /// Write one quantised V row into the transposed cache at `slot`.

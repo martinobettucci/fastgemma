@@ -41,6 +41,18 @@ static inline __m512 exp512_ps(__m512 x) {
 void fgm_fwht(float *, int, int);
 void fgm_quant_act(const float *, int, int, int8_t *, float *);
 
+// Runtime switch between the scalar and vectorised P.V weight fill.
+//
+// Both paths live in one binary on purpose. Comparing them across separate
+// runs failed: this box's AMX tile-state corruption rate drifts between runs
+// (5/12, 6/12 and 7/12 trials corrupted at warm-up in three consecutive
+// measurements), and every corrupted tile re-runs a whole GEMM block, so
+// run-to-run differences of 25% appear with no code change at all. A switch
+// lets the two arms alternate inside one measurement window, where the drift
+// is shared instead of being attributed to whichever arm ran during it.
+int fgm_scalar_wfill = 0;
+void fgm_set_scalar_wfill(int on) { fgm_scalar_wfill = on; }
+
 // ------------------------------------------------------------------ RMSNorm
 // Gemma 4: normed = x * (mean(x^2) + eps)^-0.5, then * weight (NOT 1 + weight,
 // unlike Gemma 2/3). Accumulated in f32, matching the reference which upcasts.
@@ -536,7 +548,7 @@ void fgm_attend_q8_heads(float *out, const float *q, const int8_t *kc, const flo
     // scalar path is kept. Ring layers are the sliding ones, whose range is
     // capped at the 512-token window, so the loop that matters -- full-attention
     // layers over thousands of positions -- is always the contiguous one.
-    if (!ring) {
+    if (!ring && !fgm_scalar_wfill) {
       const __m512 vscale = _mm512_set1_ps(inv * wq_inv);
       int t = start;
       for (; t + 16 <= end; t += 16) {

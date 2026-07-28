@@ -208,6 +208,8 @@ fn main() {
     let path = args.get(2).map(String::as_str).unwrap_or("/home/user/models/g4e2b.fgm");
 
     check_load();
+    // FGM_SCALAR_WFILL=1 selects the scalar P.V weight fill for A/B.
+    fgm_kernels::set_scalar_wfill(std::env::var_os("FGM_SCALAR_WFILL").is_some());
     let t0 = Instant::now();
     let model = Model::open(path).expect("open model");
     let cfg = model.cfg.clone();
