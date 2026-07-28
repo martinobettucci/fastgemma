@@ -1047,3 +1047,70 @@ hits any watcher whose arguments mention the process it waits for. That is the
 inverse bug, and it had already cost twenty minutes — `pgrep -f convert_gemma4`
 matched the waiting loop's own command line, so a finished conversion was
 reported as still running until I checked the log instead of the process table.
+
+
+---
+
+## 16. The noise floor, and two claims I have to withdraw
+
+`auto:16` measured 272.3 tok/s prefill at 1024 where pure int8 measured 255.2 —
+6.7% apart. That cannot be a real difference: under `auto:16` a 256-row prefill
+chunk selects int8 *by construction*, so the two configurations execute
+identical code. Something was wrong with the measurement, not the engine.
+
+Five runs of one fixed configuration (int8, concurrency 1, 1024 prompt):
+
+    prefill tok/s   259.3  279.5  270.9  286.7  256.7
+    decode  tok/s    12.2   12.5   12.9   13.5   13.4
+
+| | mean | std | full range |
+|---|---|---|---|
+| prefill | 270.6 | 12.8 (**4.7%**) | 256.7–286.7 (11.1%) |
+| decode | 12.90 | 0.56 (**4.4%**) | 12.2–13.5 (10.1%) |
+
+So `auto`'s 272.3 is the mean and pure int8's 255.2 sat at the bottom of the
+range. There was no anomaly to explain — only single samples being read as
+measurements.
+
+### What survives, in units of the noise it has to clear
+
+| claim | delta | σ |
+|---|---|---|
+| VNNI attention, 8192 | +34.6% | 7.4 |
+| VNNI attention, 1024 | +18.5% | 3.9 |
+| blocked attention loses, 1024 | −17.3% | 3.7 |
+| int8 vs int4 prefill, 8192 | +13.6% | 2.9 |
+| int8 vs int4 prefill, 1024 | +12.8% | 2.7 |
+| blocked attention loses, 256 | −7.7% | 1.6 |
+| **blocked attention loses, 512** | **−6.9%** | **1.5** |
+| **int4 vs int8 decode, 8192** | **+6.4%** | **1.5** |
+| **blocked attention loses, 128** | **−1.3%** | **0.3** |
+
+**Withdrawn: "blocked attention loses at every shape from 128 to 8192."** At 128
+and 512 the measured deltas are 0.3σ and 1.5σ from one sample per arm — that is
+not a result, it is noise with a sign. The *decision* to delete the path still
+stands on the 1024 and 2048 columns (3.7σ and ~2.5σ) and on it never once
+winning, but the sentence claimed more than the data supports, and at 128 in
+particular attention is only 5.1% of prefill so there was nothing there to
+measure in the first place.
+
+**Withdrawn: the decode half of the dual-weight claim as originally stated.**
++0.7% to +6.4% from single samples is 0.2σ to 1.5σ. First principles say int4
+should win decode — it is DRAM-bound and int4 halves the bytes — but "first
+principles say so" is what the 1924 GB estimate in §12 and the 11%-attention
+estimate in §14 also had going for them. Re-measured as a median of repeats it
+holds and is *larger* than first reported (§15 table revised).
+
+### The fix
+
+`FGM_REPEAT=n` runs each matrix cell n times and reports **median with full
+range**, median because a contended run is an outlier rather than a shifted
+sample, and the range printed so a reader can see whether a delta clears it.
+`ab_weights.sh` alternates arms instead of running all of one then all of the
+other, so drift over a long run is shared between arms rather than landing
+entirely on whichever goes last.
+
+**Trap 14 — a difference smaller than the noise floor is not a small result, it
+is no result.** Every A/B in this project before this section was one sample per
+arm. The ones that survive do so because they are large, not because the method
+was sound.

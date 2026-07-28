@@ -178,6 +178,17 @@ fn prof_line(r: &mut Runner, label: &str) {
     r.prof = [0.0; NPHASE];
 }
 
+/// Median and full range of a sample. Median rather than mean because a single
+/// contended run is an outlier, not a shifted sample, and the range is printed
+/// so a reader can see whether a reported delta clears the noise.
+fn med_range(v: &[f64]) -> (f64, f64, f64) {
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.total_cmp(b));
+    let n = s.len();
+    let med = if n % 2 == 1 { s[n / 2] } else { (s[n / 2 - 1] + s[n / 2]) / 2.0 };
+    (med, s[0], s[n - 1])
+}
+
 fn argmax(v: &[f32]) -> usize {
     let mut best = (0usize, f32::NEG_INFINITY);
     for (i, &x) in v.iter().enumerate() {
@@ -654,6 +665,12 @@ fn main() {
         "matrix" => {
             let conc: usize = std::env::var("FGM_CONC").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
             let chunk: usize = std::env::var("FGM_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+            // Repeat each cell and report the median. A single run of a fixed
+            // configuration on this box has std 4.7% on prefill and 4.4% on
+            // decode, with a full range over five runs of ~11%. Deltas below
+            // ~10% are therefore not measurable from one sample each, and two
+            // claims were published from single runs before this was known.
+            let reps: usize = std::env::var("FGM_REPEAT").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
             let pps: Vec<usize> = std::env::var("FGM_PP").ok()
                 .map(|v| v.split(',').map(|x| x.parse().unwrap()).collect())
                 .unwrap_or_else(|| vec![128, 256, 512, 1024, 2048, 4096, 8192]);
@@ -663,48 +680,73 @@ fn main() {
             let maxtg = *tgs.iter().max().unwrap();
             let ctx = *pps.iter().max().unwrap() + maxtg + 8;
             let mut r = Runner::new(&model, chunk.max(conc), ctx, threads());
-            println!("\n== (prompt x output) matrix, concurrency {conc}, chunk {chunk} ==");
+            println!("\n== (prompt x output) matrix, concurrency {conc}, chunk {chunk}, \
+                     {reps} rep(s) ==");
             println!("  weights {:?}", r.wsel);
-            println!("  {:>7} {:>7} {:>9} {:>9} {:>10} {:>10} {:>10}",
-                     "in", "out", "ttft_s", "gen_s", "pp_tok/s", "tg_tok/s", "req_tok/s");
+            if reps > 1 {
+                println!("  {:>7} {:>7} {:>10} {:>15} {:>10} {:>15} {:>10}",
+                         "in", "out", "pp_tok/s", "pp_range", "tg_tok/s", "tg_range", "req_tok/s");
+            } else {
+                println!("  {:>7} {:>7} {:>9} {:>9} {:>10} {:>10} {:>10}",
+                         "in", "out", "ttft_s", "gen_s", "pp_tok/s", "tg_tok/s", "req_tok/s");
+            }
             for &pp in &pps {
-                let mut caches: Vec<KvCache> =
-                    (0..conc).map(|_| KvCache::new(&cfg, pp + maxtg + 8, chunk)).collect();
-                let prompts: Vec<Vec<u32>> =
-                    (0..conc).map(|i| synth_tokens(pp, 100 + i as u64)).collect();
-                let t = Instant::now();
-                for s in 0..conc {
-                    let mut off = 0;
-                    while off < pp {
-                        let n = chunk.min(pp - off);
-                        r.forward(&prompts[s][off..off + n], off, &mut caches[s]);
-                        off += n;
+                let mut ttfts: Vec<f64> = Vec::with_capacity(reps);
+                let mut gens: Vec<Vec<f64>> = vec![Vec::with_capacity(reps); tgs.len()];
+                for _ in 0..reps {
+                    let mut caches: Vec<KvCache> =
+                        (0..conc).map(|_| KvCache::new(&cfg, pp + maxtg + 8, chunk)).collect();
+                    let prompts: Vec<Vec<u32>> =
+                        (0..conc).map(|i| synth_tokens(pp, 100 + i as u64)).collect();
+                    let t = Instant::now();
+                    for s in 0..conc {
+                        let mut off = 0;
+                        while off < pp {
+                            let n = chunk.min(pp - off);
+                            r.forward(&prompts[s][off..off + n], off, &mut caches[s]);
+                            off += n;
+                        }
+                    }
+                    ttfts.push(t.elapsed().as_secs_f64());
+                    prof_line(&mut r, &format!("prefill {pp}"));
+
+                    let mut toks: Vec<u32> = (0..conc).map(|i| 1000 + i as u32).collect();
+                    let seq: Vec<usize> = (0..conc).collect();
+                    let rows: Vec<usize> = (0..conc).collect();
+                    let mut done = 0usize;
+                    let t0 = Instant::now();
+                    for (gi, &tg) in tgs.iter().enumerate() {
+                        while done < tg {
+                            let pos: Vec<usize> = vec![pp + done; conc];
+                            let lg = r.forward_multi(&toks, &seq, &pos, &mut caches, &rows);
+                            for s in 0..conc {
+                                toks[s] =
+                                    argmax(&lg[s * cfg.vocab_size..(s + 1) * cfg.vocab_size]) as u32;
+                            }
+                            done += 1;
+                        }
+                        gens[gi].push(t0.elapsed().as_secs_f64());
+                        prof_line(&mut r, &format!("decode {tg} @ctx {pp}"));
                     }
                 }
-                let ttft = t.elapsed().as_secs_f64();
-                prof_line(&mut r, &format!("prefill {pp}"));
-
-                let mut toks: Vec<u32> = (0..conc).map(|i| 1000 + i as u32).collect();
-                let seq: Vec<usize> = (0..conc).collect();
-                let rows: Vec<usize> = (0..conc).collect();
-                let mut done = 0usize;
-                let t0 = Instant::now();
-                for &tg in &tgs {
-                    while done < tg {
-                        let pos: Vec<usize> = vec![pp + done; conc];
-                        let lg = r.forward_multi(&toks, &seq, &pos, &mut caches, &rows);
-                        for s in 0..conc {
-                            toks[s] = argmax(&lg[s * cfg.vocab_size..(s + 1) * cfg.vocab_size]) as u32;
-                        }
-                        done += 1;
+                for (gi, &tg) in tgs.iter().enumerate() {
+                    let pp_rates: Vec<f64> =
+                        ttfts.iter().map(|t| (conc * pp) as f64 / t).collect();
+                    let tg_rates: Vec<f64> =
+                        gens[gi].iter().map(|t| (conc * tg) as f64 / t).collect();
+                    let (ppm, pplo, pphi) = med_range(&pp_rates);
+                    let (tgm, tglo, tghi) = med_range(&tg_rates);
+                    let req: Vec<f64> = ttfts.iter().zip(&gens[gi])
+                        .map(|(a, b)| (conc * (pp + tg)) as f64 / (a + b)).collect();
+                    let (reqm, _, _) = med_range(&req);
+                    if reps > 1 {
+                        println!("  {:>7} {:>7} {:>10.1} {:>15} {:>10.1} {:>15} {:>10.1}",
+                                 pp, tg, ppm, format!("{pplo:.0}-{pphi:.0}"),
+                                 tgm, format!("{tglo:.1}-{tghi:.1}"), reqm);
+                    } else {
+                        println!("  {:>7} {:>7} {:>9.2} {:>9.2} {:>10.1} {:>10.1} {:>10.1}",
+                                 pp, tg, ttfts[0], gens[gi][0], ppm, tgm, reqm);
                     }
-                    let gen = t0.elapsed().as_secs_f64();
-                    println!("  {:>7} {:>7} {:>9.2} {:>9.2} {:>10.1} {:>10.1} {:>10.1}",
-                             pp, tg, ttft, gen,
-                             (conc * pp) as f64 / ttft,
-                             (conc * done) as f64 / gen,
-                             (conc * (pp + done)) as f64 / (ttft + gen));
-                    prof_line(&mut r, &format!("decode {tg} @ctx {pp}"));
                 }
             }
         }

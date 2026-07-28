@@ -1,17 +1,21 @@
 #!/bin/bash
 # A/B int4 vs int8 weights on a dual-format model.
 #
+# Median of FGM_REPEAT runs per cell. A single run of a fixed configuration on
+# this box has std 4.7% on prefill and 4.4% on decode, so a one-sample-per-arm
+# comparison cannot resolve anything under ~10% -- and two claims were published
+# from exactly that before the noise floor was measured.
+#
 # The file is read into page cache first: it is 4.34 GB and a cold first touch
-# reads as a 40% throughput regression that has nothing to do with the weights.
-# Then wait for idle -- the previous run's threads take a few seconds to retire
-# and the load guard will refuse the next one.
+# reads as a ~40% regression that has nothing to do with the weights.
+#
+# Arms alternate rather than running all of one then all of the other, so any
+# drift over the run (thermal, page cache, whatever else) is shared between them
+# instead of landing entirely on whichever arm goes last.
 set -u
 M=${1:-/home/user/models/g4e2b-dual.fgm}
 BIN=./target/release/fgm-bench
-# Wait for a genuinely free box. Checking loadavg alone is not enough: it is a
-# one-minute decaying average, so a four-thread competitor one second old barely
-# moves it. An orphaned bench from a killed run slipped past exactly that check
-# and made one arm of this comparison read 2x low.
+REPS=${REPS:-5}
 idle() {
   for _ in $(seq 240); do
     if ! pgrep -x fgm-bench >/dev/null; then
@@ -24,11 +28,11 @@ idle() {
 }
 echo "warming page cache for $M"
 dd if="$M" of=/dev/null bs=16M status=none
-for w in int4 int8; do
-  for c in 1 8; do
+for c in ${CONCS:-1 8}; do
+  for w in int4 int8; do
     idle
-    echo "### FGM_WEIGHTS=$w concurrency=$c"
-    FGM_WEIGHTS=$w FGM_CONC=$c FGM_PP=${PPS:-1024,8192} FGM_TG=${TGS:-128} \
-      $BIN matrix "$M" 2>/dev/null | grep -E "^ +[0-9]+ +[0-9]+ "
+    echo "### FGM_WEIGHTS=$w concurrency=$c reps=$REPS"
+    FGM_WEIGHTS=$w FGM_CONC=$c FGM_REPEAT=$REPS FGM_PP=${PPS:-1024,8192} FGM_TG=${TGS:-128} \
+      $BIN matrix "$M" 2>/dev/null | grep -E "^ +[0-9]+ +[0-9]+ |SUSPECT"
   done
 done
