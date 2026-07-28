@@ -161,6 +161,16 @@ macro_rules! tock {
 
 impl<'m> Runner<'m> {
     pub fn new(model: &'m Model, max_tokens: usize, max_ctx: usize, threads: usize) -> Self {
+        // Prefill only needs the last row's logits; batched decode needs one per
+        // sequence. Validation asks for all of them, so cap and assert rather
+        // than let a large request scribble past the buffer.
+        Self::with_logit_rows(model, max_tokens, max_ctx, threads, max_tokens.min(16))
+    }
+
+    pub fn with_logit_rows(
+        model: &'m Model, max_tokens: usize, max_ctx: usize, threads: usize,
+        max_logit_rows: usize,
+    ) -> Self {
         assert!(k::amx_init(), "AMX XTILEDATA permission denied");
         let cfg = model.cfg.clone();
         let (hs, nl) = (cfg.hidden_size, cfg.num_hidden_layers);
@@ -233,7 +243,7 @@ impl<'m> Runner<'m> {
                 ple_proj: vec![0.0; nl * pd],
                 tmp: vec![0.0; hs.max(kmax)],
                 sc: vec![0.0; max_ctx + 64],
-                logits: vec![0.0; max_tokens.min(16) * cfg.vocab_size],
+                logits: vec![0.0; max_logit_rows * cfg.vocab_size],
             },
             pool: Pool::new(threads, max_ctx + 64),
             layers,
@@ -286,6 +296,12 @@ impl<'m> Runner<'m> {
         caches: &mut [KvCache],
         logit_rows: &[usize],
     ) -> &[f32] {
+        assert!(
+            logit_rows.len() * self.cfg.vocab_size <= self.b.logits.len(),
+            "requested {} logit rows but the runner was built for {}",
+            logit_rows.len(),
+            self.b.logits.len() / self.cfg.vocab_size
+        );
         let model = self.model;
         let cfg = &self.cfg;
         let (hs, m) = (cfg.hidden_size, tokens.len());

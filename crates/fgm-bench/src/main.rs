@@ -51,23 +51,31 @@ fn main() {
               cfg.intermediate_size, cfg.vocab_size, threads());
 
     match mode {
+        // Logits for EVERY position of the prompt, so validation can measure
+        // greedy agreement over many positions instead of one near-tied token.
         "dump" => {
             let toks: Vec<u32> = args[3].split(',').map(|x| x.parse().unwrap()).collect();
-            let mut kv = KvCache::new(&cfg, 512);
-            let mut r = Runner::new(&model, toks.len().max(8), 512, threads());
+            let m = toks.len();
+            let mut caches = vec![KvCache::new(&cfg, m + 8)];
+            let mut r = Runner::with_logit_rows(&model, m.max(8), m + 8, threads(), m);
+            let seq = vec![0usize; m];
+            let pos: Vec<usize> = (0..m).collect();
+            let rows: Vec<usize> = (0..m).collect();
             let t = Instant::now();
-            let logits = r.forward(&toks, 0, &mut kv);
-            eprintln!("forward {} tok in {:?}", toks.len(), t.elapsed());
-            let mut top: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+            let logits = r.forward_multi(&toks, &seq, &pos, &mut caches, &rows);
+            eprintln!("forward {m} tok in {:?} ({} logit rows)", t.elapsed(), rows.len());
+            let v = cfg.vocab_size;
+            let last = &logits[(m - 1) * v..m * v];
+            let mut top: Vec<(usize, f32)> = last.iter().copied().enumerate().collect();
             top.sort_by(|a, b| b.1.total_cmp(&a.1));
-            eprintln!("top5: {:?}", &top[..5]);
+            eprintln!("last-position top5: {:?}", &top[..5]);
             if let Some(out) = args.get(4) {
                 let mut bytes = Vec::with_capacity(logits.len() * 4);
-                for v in logits {
-                    bytes.extend_from_slice(&v.to_le_bytes());
+                for x in logits {
+                    bytes.extend_from_slice(&x.to_le_bytes());
                 }
                 std::fs::write(out, &bytes).expect("write");
-                eprintln!("wrote {} logits -> {out}", logits.len());
+                eprintln!("wrote {} x {} logits -> {out}", m, v);
             }
         }
 
