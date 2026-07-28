@@ -31,6 +31,8 @@
 #include <sys/syscall.h>
 #include <immintrin.h>
 #include <stdatomic.h>
+#include <time.h>
+#include <pthread.h>
 
 #define ARCH_REQ_XCOMP_PERM 0x1023
 #define XFEATURE_XTILEDATA 18
@@ -161,9 +163,77 @@ static const int32_t *acc_seed(void) {
   return seed;
 }
 
+// Warm-up probe: is this platform actually broken?
+//
+// The guard costs 1-2%, so it should only run where it is needed.
+//
+// Getting this detector right took two attempts. A `nanosleep` between load and
+// store -- a *voluntary* context switch -- shows zero corruption even at 1.6 ms,
+// on a box whose GEMMs demonstrably corrupt. Whatever loses the tile file is the
+// *involuntary* preemption path, so the probe has to create real scheduling
+// pressure rather than yield politely. It oversubscribes the machine with
+// spinner threads and busy-waits while holding tile state.
+//
+// A platform that saves and restores XTILEDATA passes every trial regardless of
+// load. A broken one fails a large fraction within a few tens of milliseconds.
+//
+// Returns the number of corrupted trials.
+static _Atomic int probe_stop = 0;
+static void *probe_spinner(void *unused) {
+  (void)unused;
+  volatile double x = 0;
+  while (!atomic_load_explicit(&probe_stop, memory_order_relaxed)) x += 1.0;
+  return NULL;
+}
+
+static double probe_now(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return t.tv_sec + 1e-9 * t.tv_nsec;
+}
+
+int fgm_tile_probe(int trials, long hold_us) {
+  long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+  if (ncpu < 1) ncpu = 4;
+  int nspin = (int)(ncpu * 2);          // oversubscribe to force preemption
+  if (nspin > 32) nspin = 32;
+  pthread_t *th = malloc(sizeof(pthread_t) * nspin);
+  atomic_store(&probe_stop, 0);
+  for (int i = 0; i < nspin; i++) pthread_create(&th[i], NULL, probe_spinner, NULL);
+
+  cfg_2x2(16, 16);
+  _Alignas(64) int8_t pat[1024], out[1024];
+  for (int i = 0; i < 1024; i++) pat[i] = (int8_t)(i * 37 + 11);
+  int bad = 0;
+  const double hold = hold_us * 1e-6;
+  volatile double sink = 0;
+  for (int t = 0; t < trials; t++) {
+    _tile_loadd(0, pat, 64);
+    double t0 = probe_now();
+    while (probe_now() - t0 < hold) sink += 1.0;
+    memset(out, 0, sizeof(out));
+    _tile_stored(0, out, 64);
+    if (memcmp(out, pat, 1024)) bad++;
+  }
+  (void)sink;
+  _tile_release();
+
+  atomic_store(&probe_stop, 1);
+  for (int i = 0; i < nspin; i++) pthread_join(th[i], NULL);
+  free(th);
+  return bad;
+}
+
+// -1 unknown, 0 off, 1 on. Set by fgm_tile_guard_set from the probe result, or
+// forced by FGM_TILE_GUARD=on|off (default: auto-detect).
 static int guard_on = -1;
+
+void fgm_tile_guard_set(int on) { guard_on = on ? 1 : 0; }
+
 static inline int tile_guard(void) {
   if (guard_on < 0) {
+    // Fail safe: if nobody ran the probe, guard rather than risk silent
+    // corruption. FGM_NO_TILE_GUARD=1 still forces it off for A/B measurement.
     const char *e = getenv("FGM_NO_TILE_GUARD");
     guard_on = !(e && e[0] == '1');
   }

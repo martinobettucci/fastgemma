@@ -477,6 +477,32 @@ Note this hits **any** AMX user on this VM, including llama.cpp built with
 comparison is still valid — and it is the honest comparison anyway, since that
 is what llama.cpp actually ships.
 
+### Only pay for the guard where it is needed
+
+The guard costs 1-2%, so it should be conditional on the platform actually being
+broken. Detection took two attempts, and the failed one is the interesting part.
+
+**Attempt 1 — hold tile state across `nanosleep`.** A sleep is a guaranteed
+reschedule point, so this looked like a clean forced-preemption test. It reports
+**zero corruption even at a 1.6 ms hold**, on the very box whose GEMMs
+demonstrably corrupt. So a *voluntary* context switch preserves XTILEDATA
+correctly; only *involuntary* preemption loses it. That is a useful clue about
+where the fault lives, and it would have been a catastrophic false negative:
+the guard would have switched itself off on a broken machine.
+
+**Attempt 2 — make the probe generate real scheduling pressure.** Oversubscribe
+the machine (2x cores in spinner threads), busy-wait while holding tile state.
+This detects reliably, and escalates the hold time until it is conclusive
+(2 ms → 8 ms → 16 ms), because the stakes are asymmetric: a false positive costs
+1-2% throughput, a false negative means silently wrong answers under load.
+
+Measured on this box, 5 consecutive warm-ups, 12 trials each:
+detected every time at the first 2 ms stage (5-7 of 12 trials corrupted), with
+end-to-end determinism 0.000000 in all five. Warm-up cost ~25 ms.
+
+`FGM_TILE_GUARD=on|off` overrides; the default is auto-detect, and the fallback
+if the probe never runs is guard-on rather than risk silent corruption.
+
 ### The guard works
 
 Under 6-way CPU contention, same GEMM repeated:

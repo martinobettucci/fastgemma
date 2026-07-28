@@ -169,6 +169,17 @@ impl<'m> Runner<'m> {
         max_logit_rows: usize,
     ) -> Self {
         assert!(k::amx_init(), "AMX XTILEDATA permission denied");
+        // Warm-up: only pay for the corruption guard on platforms that need it.
+        let (guard, bad, hold) = k::tile_guard_autodetect(12);
+        if guard && hold > 0 {
+            eprintln!(
+                "fastgemma: AMX tile state NOT preserved across context switches \
+                 ({bad}/12 trials corrupted at {}us hold) -- guard ENABLED (~1-2%)",
+                hold
+            );
+        } else if !guard {
+            eprintln!("fastgemma: AMX tile state verified across preemption -- guard disabled");
+        }
         let cfg = model.cfg.clone();
         let (hs, nl) = (cfg.hidden_size, cfg.num_hidden_layers);
         let pd = cfg.hidden_size_per_layer_input;

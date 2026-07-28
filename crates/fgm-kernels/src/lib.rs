@@ -11,6 +11,10 @@ pub type f16 = u16;
 
 extern "C" {
     fn fgm_amx_init() -> i32;
+    fn fgm_tile_probe(trials: i32, sleep_us: i64) -> i32;
+    fn fgm_tile_guard_set(on: i32);
+    fn fgm_tile_retry_count() -> i64;
+    fn fgm_tile_retry_reset();
     fn fgm_pack_a(m: i32, k: i32, a: *const i8, ap: *mut i8);
     fn fgm_gemm_q4g(
         m: i32, n: i32, k: i32, a: *const i8, a_scale: *const f32,
@@ -229,4 +233,69 @@ pub fn attend_q8_heads(
             h0 as i32, h1 as i32, ring as i32,
         )
     }
+}
+
+/// Does this platform preserve AMX tile state across a context switch?
+///
+/// Some hypervisors do not: tiles come back zeroed, so any accumulator held in
+/// a tile across a k-loop silently loses everything summed before the switch.
+/// The probe forces the condition with an explicit `nanosleep` rather than
+/// waiting for ambient load, so the answer does not depend on how busy the box
+/// happens to be during warm-up.
+///
+/// Returns the number of corrupted trials out of `trials`. `hold_us` is how
+/// long tile state is held per trial; the probe oversubscribes the machine with
+/// spinner threads for the duration, because a *voluntary* context switch
+/// (nanosleep) does not reproduce the fault — only involuntary preemption does.
+pub fn tile_probe(trials: usize, hold_us: i64) -> usize {
+    unsafe { fgm_tile_probe(trials as i32, hold_us) as usize }
+}
+
+/// Force the in-GEMM corruption guard on or off. The guard costs 1-2%, so it
+/// should only run where [`tile_probe`] found a defect.
+pub fn tile_guard_set(on: bool) {
+    unsafe { fgm_tile_guard_set(i32::from(on)) }
+}
+
+/// Corruptions detected and recovered since the last reset.
+pub fn tile_retries() -> u64 {
+    unsafe { fgm_tile_retry_count() as u64 }
+}
+
+pub fn tile_retries_reset() {
+    unsafe { fgm_tile_retry_reset() }
+}
+
+/// Run the probe and configure the guard accordingly.
+/// `FGM_TILE_GUARD=on|off` overrides the decision.
+///
+/// The stakes are asymmetric: a false positive costs 1-2% throughput, a false
+/// negative means silently wrong answers under load. So detection escalates the
+/// hold time until it either finds corruption or has looked hard enough that a
+/// clean result is trustworthy. Corruption probability rises steeply with hold
+/// time (measured: ~3% at 100 us, 16% at 1 ms, 89% at 10 ms), so the 16 ms stage
+/// is effectively conclusive.
+///
+/// Returns (guard_enabled, corrupted_trials, hold_us_that_found_it).
+pub fn tile_guard_autodetect(trials: usize) -> (bool, usize, i64) {
+    match std::env::var("FGM_TILE_GUARD").as_deref() {
+        Ok("on") => {
+            tile_guard_set(true);
+            return (true, 0, 0);
+        }
+        Ok("off") => {
+            tile_guard_set(false);
+            return (false, 0, 0);
+        }
+        _ => {}
+    }
+    for hold_us in [2_000i64, 8_000, 16_000] {
+        let bad = tile_probe(trials, hold_us);
+        if bad > 0 {
+            tile_guard_set(true);
+            return (true, bad, hold_us);
+        }
+    }
+    tile_guard_set(false);
+    (false, 0, 0)
 }

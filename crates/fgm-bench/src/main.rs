@@ -299,6 +299,85 @@ fn main() {
             }
         }
 
+        // Full target-range curves: prefill 128..8192 and decode 128..2048,
+        // at the concurrency given by FGM_CONC. Prefill is chunked (FGM_CHUNK)
+        // because that is how a server actually runs it.
+        "curve" => {
+            let conc: usize = std::env::var("FGM_CONC").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+            let chunk: usize = std::env::var("FGM_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+            let pps: Vec<usize> = std::env::var("FGM_PP").ok()
+                .map(|v| v.split(',').map(|x| x.parse().unwrap()).collect())
+                .unwrap_or_else(|| vec![128, 256, 512, 1024, 2048, 4096, 8192]);
+            let tgs: Vec<usize> = std::env::var("FGM_TG").ok()
+                .map(|v| v.split(',').map(|x| x.parse().unwrap()).collect())
+                .unwrap_or_else(|| vec![128, 256, 512, 1024, 2048]);
+            let maxpp = *pps.iter().max().unwrap();
+            let maxtg = *tgs.iter().max().unwrap();
+            let ctx = maxpp + maxtg + 8;
+
+            println!("\n== curves: concurrency {conc}, prefill chunk {chunk}, {} threads ==", threads());
+            let mut r = Runner::new(&model, chunk.max(conc), ctx, threads());
+
+            println!("\n-- prefill (aggregate over {conc} sequence(s)) --");
+            println!("  {:>7} {:>10} {:>12} {:>10}", "prompt", "time", "tok/s", "ms/tok");
+            for &pp in &pps {
+                let mut caches: Vec<KvCache> =
+                    (0..conc).map(|_| KvCache::new(&cfg, pp + 8, chunk)).collect();
+                let prompts: Vec<Vec<u32>> =
+                    (0..conc).map(|i| synth_tokens(pp, 100 + i as u64)).collect();
+                let t = Instant::now();
+                for s in 0..conc {
+                    let mut off = 0;
+                    while off < pp {
+                        let n = chunk.min(pp - off);
+                        r.forward(&prompts[s][off..off + n], off, &mut caches[s]);
+                        off += n;
+                    }
+                }
+                let el = t.elapsed().as_secs_f64();
+                let tot = (conc * pp) as f64;
+                println!("  {:>7} {:>9.2}s {:>12.1} {:>10.3}", pp, el, tot / el, el * 1000.0 / tot);
+            }
+
+            println!("\n-- decode after an {maxpp}-token prompt (aggregate over {conc}) --");
+            println!("  {:>7} {:>10} {:>12} {:>12} {:>10}",
+                     "out", "time", "tok/s", "tok/s/seq", "ms/step");
+            let mut caches: Vec<KvCache> =
+                (0..conc).map(|_| KvCache::new(&cfg, ctx, chunk)).collect();
+            let prompts: Vec<Vec<u32>> =
+                (0..conc).map(|i| synth_tokens(maxpp, 100 + i as u64)).collect();
+            for s in 0..conc {
+                let mut off = 0;
+                while off < maxpp {
+                    let n = chunk.min(maxpp - off);
+                    r.forward(&prompts[s][off..off + n], off, &mut caches[s]);
+                    off += n;
+                }
+            }
+            let mut toks: Vec<u32> = (0..conc).map(|i| 1000 + i as u32).collect();
+            let seq: Vec<usize> = (0..conc).collect();
+            let rows: Vec<usize> = (0..conc).collect();
+            let mut done = 0usize;
+            let t0 = Instant::now();
+            for &tg in &tgs {
+                while done < tg {
+                    let pos: Vec<usize> = vec![maxpp + done; conc];
+                    let lg = r.forward_multi(&toks, &seq, &pos, &mut caches, &rows);
+                    for s in 0..conc {
+                        toks[s] = argmax(&lg[s * cfg.vocab_size..(s + 1) * cfg.vocab_size]) as u32;
+                    }
+                    done += 1;
+                }
+                let el = t0.elapsed().as_secs_f64();
+                let tot = (done * conc) as f64;
+                println!("  {:>7} {:>9.2}s {:>12.1} {:>12.1} {:>10.1}",
+                         tg, el, tot / el, done as f64 / el, el * 1000.0 / done as f64);
+            }
+            println!("  kv {:.0} MB total ({:.1} MB/seq at {} ctx)",
+                     caches.iter().map(|c| c.bytes()).sum::<usize>() as f64 / 1e6,
+                     caches[0].bytes() as f64 / 1e6, ctx);
+        }
+
         m => {
             eprintln!("unknown mode {m}");
             std::process::exit(2);
