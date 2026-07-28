@@ -687,8 +687,14 @@ fn main() {
                      {reps} rep(s) ==");
             println!("  weights {:?}", r.wsel);
             if reps > 1 {
-                println!("  {:>7} {:>7} {:>10} {:>15} {:>10} {:>15} {:>10}",
-                         "in", "out", "pp_tok/s", "pp_range", "tg_tok/s", "tg_range", "req_tok/s");
+                // AMX tile-guard retries are reported per row because the
+                // platform's corruption rate is not constant: runs have shown
+                // 5/12 and 7/12 trials corrupted at warm-up, and every retry
+                // re-runs a whole GEMM block. A slow run with a high retry
+                // count is the platform, not the code.
+                println!("  {:>7} {:>7} {:>10} {:>15} {:>10} {:>15} {:>10} {:>10}",
+                         "in", "out", "pp_tok/s", "pp_range", "tg_tok/s", "tg_range",
+                         "req_tok/s", "retries");
             } else {
                 println!("  {:>7} {:>7} {:>9} {:>9} {:>10} {:>10} {:>10}",
                          "in", "out", "ttft_s", "gen_s", "pp_tok/s", "tg_tok/s", "req_tok/s");
@@ -743,9 +749,10 @@ fn main() {
                         .map(|(a, b)| (conc * (pp + tg)) as f64 / (a + b)).collect();
                     let (reqm, _, _) = med_range(&req);
                     if reps > 1 {
-                        println!("  {:>7} {:>7} {:>10.1} {:>15} {:>10.1} {:>15} {:>10.1}",
+                        println!("  {:>7} {:>7} {:>10.1} {:>15} {:>10.1} {:>15} {:>10.1} {:>10}",
                                  pp, tg, ppm, format!("{pplo:.0}-{pphi:.0}"),
-                                 tgm, format!("{tglo:.1}-{tghi:.1}"), reqm);
+                                 tgm, format!("{tglo:.1}-{tghi:.1}"), reqm,
+                                 fgm_kernels::tile_retries());
                     } else {
                         println!("  {:>7} {:>7} {:>9.2} {:>9.2} {:>10.1} {:>10.1} {:>10.1}",
                                  pp, tg, ttfts[0], gens[gi][0], ppm, tgm, reqm);
