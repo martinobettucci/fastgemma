@@ -192,6 +192,19 @@ impl Model {
         }
     }
 
+    /// A linear plus its int8 twin if `--weights=both` stored one.
+    ///
+    /// The twin lives at `<name>.i8`, so a file converted without it simply
+    /// resolves to `None` and the runtime keeps using the primary -- old files
+    /// stay loadable and nothing has to know which kind it opened.
+    pub fn dual(&self, name: &str) -> crate::forward::DualW<'_> {
+        let alt = format!("{name}.i8");
+        crate::forward::DualW::new(
+            self.linear(name),
+            self.has(&alt).then(|| self.linear(&alt)),
+        )
+    }
+
     /// Gather one row of a row-major quantised table into `out`.
     pub fn gather(&self, name: &str, row: usize, out: &mut [f32]) {
         let e = self.entry(name);

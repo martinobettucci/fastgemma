@@ -21,14 +21,16 @@ no GPU. **Target workload:** 8 concurrent requests, ~8k prompt in, ~2k out,
 | KV sharing + sliding-window KV | **done** | 32 MB/seq at 8k vs ~1.8 GB naive for 8 seqs |
 | Batched decode (shared GEMM across seqs) | **done** | `forward_multi` |
 | Persistent worker pool | **done** | GEMM split on N, attention on (token, head) |
-| Flash-tiled attention + AMX-INT8 Q·Kᵀ | **open** | biggest *prefill* win: 42% collapse 128→8192 is attention |
-| Multithread the GEMM preamble (FWHT/quant/pack) | **open** | ~half of "ffn_gemm" time is not GEMM; ~20-30% of prefill |
+| Flash-tiled attention | **rejected (measured)** | −7 to −12% at every context we serve; K/V is already L2-resident with 1 KV head. Kept behind `FGM_BLOCKED_ATTN=1` for E4B / longer context. §12 |
+| AMX-INT8 Q·Kᵀ | **open** | separate from blocking; the dot products themselves are still AVX-512 |
+| Multithread the GEMM preamble (FWHT/quant/pack) | **done** | measured +25% at 2k, +20% at 4k, +9% at 8k prefill; bit-exact |
 | K-blocking for L1-resident AMX operands | **open** | GEMM 3.7 of ~11.8 achievable TOPS |
 | BF16 attention | **rejected** | KV is already int8 — bf16 *doubles* KV bandwidth, and AMX-BF16 is half AMX-INT8 (7.0 vs 14.69 TOPS). Only P·V is a genuine candidate |
-| Dual-format weights (int8 prefill / int4 decode) | **open** | prefill is compute-bound, decode DRAM-bound |
-| Prefix radix cache (shared tool definitions) | **open** | 12 tools × 4 params is identical across the 8 requests |
+| Dual-format weights (int8 prefill / int4 decode) | **built, measuring** | converter `--weights=both` (+1.56 GB: an int8 twin is 2× the int4 bytes), runtime `FGM_WEIGHTS=int4\|int8\|auto:M` |
+| Prefix sharing (shared tool definitions) | **in progress** | `KvCache::fork_from`; 12 tools × 4 params is identical across the 8 requests |
 | Chunked prefill + decode piggyback | **open** | amortise weight reads across both phases |
-| Grammar-constrained tool decoding | **done** | 1011-state DFA, 33 MB mask, 36% of steps forced |
+| Grammar-constrained tool decoding | **done (rewritten)** | Gemma 4 *native* call syntax, not JSON: 518-state DFA, 17 MB mask, 42% of steps forced. The JSON version could reach only 1 of 12 tools. §7 |
+| Behavioural acceptance eval (tools + 8k retention) | **in progress** | replaces HF logit agreement as the accuracy gate |
 | Activation-sparsity skipping | **n/a** | Gemma 3n had 95% sparsity; **Gemma 4 does not** |
 | AMX tile-state guard (platform defect) | **done** | sentinel-biased accumulator + per-block retry, 1-2% cost |
 | **Speculative multi-token prediction (MTP)** | **queued — after base perf** | https://ai.google.dev/gemma/docs/mtp/overview — explore an MTP drafter *only once base throughput is squeezed out*, per the brief. Decode here is DRAM-bound at batch 8, which is exactly the regime where speculation pays: extra tokens per weight read are ~free. Open questions: does Gemma 4 ship MTP heads for E2B/E4B, or do we train/distil a drafter? How does the accept rate interact with grammar constraints (a rejected draft inside a JSON tool call is cheap to re-mask, so acceptance may be *higher* under constraints)? |
@@ -672,27 +674,154 @@ far easier than K-blocking.
 
 ## 7. Constrained tool calling
 
-DFA over the tool schemas → per-state token bitset. On the real 262144-token
-vocab, 12 tools × 4 params: **1011 states, 3.4 s one-time compile, 33.1 MB of
-mask**, walk accepted in 47 steps emitting
+DFA over the tool schemas → per-state token bitset. Masking is one AND per step;
+the compile is one-time per tool set.
 
-    {"name": "tool_0", "arguments": {"p0": " ", "p1": 1.1, "p2": true, "p3": 1}}
+### 7a. First attempt (wrong grammar, three bugs) — kept as the record
 
-which parses, with the right tool and 4/4 args. Structural validity is a
-guarantee, not a hope.
-
-**36% of steps admit exactly one token.** Those steps can skip the LM head
-entirely — a 201 MB int4 read whose argmax is predetermined. Wiring that up is
-the next decode win for tool-heavy traffic.
+The first version constrained decoding to **JSON**: `{"name": "tool_0",
+"arguments": {…}}`. On the real 262144-token vocab, 12 tools × 4 params it
+reported 1011 states, 3.4 s compile, 33.1 MB of mask, a walk accepted in 47
+steps, output that parsed with the right tool and 4/4 args, and 36% of steps
+admitting exactly one token. All of those numbers were real. The feature was
+still broken in three separate ways, and *every one of them passed the "it
+emitted valid JSON" check*.
 
 **Trap 8 — special tokens have literal byte forms.** `<pad>` decodes to the five
 bytes `<pad>`, which satisfy the JSON string-body class, so the first
 constrained walk emitted `{"p0": "<pad><pad><pad>…` forever *without ever
 violating the grammar*. Added/special tokens are now returned as empty byte
-strings, making them permanently illegal.
+strings, making them unreachable by the byte walk.
 
 **Trap 9 — a weak checker confirms whatever you believe.** The number rule was
 "digits and dots", which accepts `..` and the empty string; the walk emitted
 `"p1": ..` and my bracket-counting "is valid JSON" check passed it. Replaced
-with a real JSON number DFA and a real `serde_json` parse. If the validity check
-is weaker than the property being claimed, it is not evidence.
+with a real number DFA and a real parse. If the validity check is weaker than
+the property being claimed, it is not evidence.
+
+**Trap 10 — eleven of twelve tools were unreachable.** Each tool chained its own
+literal from the start state, so the start state held twelve edges keyed on the
+same first byte and `step` always took the first. Measured: `reachable 1/12`.
+The constraint could only ever emit `tool_0` — *tool selection, the half of the
+brief weighted equally with speed, did not work at all*. A walk that emits one
+valid call cannot see this, because the one call it emits is the reachable one.
+The test that finds it is boring: assert that every tool in the set can be
+spelled out.
+
+**Trap 11 — `false` dead-ended.** Bool and Enum alternatives ended in separate
+states joined by a fake byte-0 edge instead of converging, so choosing `false`
+landed in a state with no outgoing edges: empty mask, every logit −∞. Latent in
+every schema with a boolean, which is most of them.
+
+### 7b. The grammar was JSON. The model does not speak JSON.
+
+`tokenizer_config.json` ships `response_template.fields.tool_calls`:
+
+    open_pattern  <\|tool_call>call:(?P<name>\w+)
+    close         <tool_call|>
+    content       json, unquoted_keys=true, string_delims=[["<|"|>", "<|"|>"]]
+
+Confirmed against the published format, which our builder now reproduces
+byte-for-byte:
+
+    <bos><|turn>system
+    You are a helpful assistant.<|tool>declaration:get_current_weather{description:<|"|>…<|"|>,
+    parameters:{properties:{…}},required:[<|"|>location<|"|>],type:<|"|>OBJECT<|"|>}}<tool|><turn|>
+    <|turn>user
+    Hey, what's the weather in Tokyo right now?<turn|>
+    <|turn>model
+    <|tool_call>call:get_current_weather{location:<|"|>Tokyo, JP<|"|>}<tool_call|>
+
+Three delimiters are **single vocabulary tokens**, not text: `<|tool_call>`=48,
+`<tool_call|>`=49, `<|"|>`=52. Keys are bare. Strings are token-delimited, so a
+string body may contain `"` freely and needs no escape machinery.
+
+Constraining this model to JSON forbids the token it wants at every structural
+position and forces one it has never emitted there. That is the worst thing a
+constraint can do: it converts a model that knows the format into a model
+fighting the mask. The measured "structural validity" was real and completely
+beside the point.
+
+Delimiters are now reachable only through explicit per-state **token edges** —
+which keeps `<pad>` out (they have no byte form) while letting exactly the three
+delimiters in exactly where the grammar wants them.
+
+12 tools × 4 params on the real vocab:
+
+| | states | compile | mask | tools reachable | forced steps |
+|---|---|---|---|---|---|
+| JSON grammar | 1011 | 3.4 s | 33.1 MB | **1/12** | 36% |
+| native grammar | 518 | 1.6 s | 17.0 MB | **12/12** | 42% |
+
+Smaller, faster, correct, and closer to the model's own distribution.
+
+**42% of steps admit exactly one token.** Those steps skip the LM head
+entirely — a 201 MB int4 read whose argmax is predetermined (`forward_nolm`).
+
+`crates/fgm-core/tests/grammar.rs` has one test per bug above. Every one of them
+fails against the previous grammar.
+
+### 7c. What the checks should have been
+
+Three checks passed while the feature was broken: "it compiled", "the walk was
+accepted", "the output parsed". They share a flaw — each verifies a property of
+*one* path through the grammar, and the grammar's whole job is to offer many.
+The replacements assert coverage instead of instance: every tool spellable,
+every alternative completable, every malformed string rejected.
+
+---
+
+## 12. Blocked attention: a negative result, and why the estimate was wrong
+
+Flash-style blocking (online softmax, block over query positions × heads) was
+supposed to be the prefill win. It is not. A/B on an idle box, single sequence,
+prefill tok/s, g256 weights:
+
+| ctx | blocked | per-head | delta |
+|---|---|---|---|
+| 1024 | 171.6 | 188.1 | −8.8% |
+| 2048 | 149.5 | 169.8 | −12.0% |
+| 4096 | 123.7 | 135.1 | −8.4% |
+| 8192 | 91.6 | 98.6 | −7.1% |
+
+Two mistakes, in order of embarrassment.
+
+**The first was in the kernel.** It dequantised each K block into an f32 scratch
+buffer before the dot products — a 4× expansion that turned a 1 MB int8 block
+into 4 MB and spilled the very L2 the blocking existed to exploit. Measured
+−9.3% at 1024 and −15.5% at 2048. Fixed by keeping K int8 in cache and widening
+inline with `_mm512_cvtepi8_epi32` per 16 lanes. That recovered part of the gap.
+
+**The second was in the estimate, and it was the real error.** The work was
+motivated by "1924 GB of KV re-reads", computed assuming those re-reads hit
+DRAM. They do not. With one KV head the int8 K set is 0.5 MB at 2k context and
+2 MB at 8k — already L2-resident on the per-head path. There was no DRAM traffic
+to save. Blocking therefore bought nothing and paid for the online-softmax
+rescaling per block, plus a coarser parallel decomposition than the per-head
+path's (row, head) pairs.
+
+The lesson is narrow and reusable: **a traffic estimate that does not name the
+cache level it assumes is not an estimate.** Bytes moved is not a cost until you
+say where they move from. Both numbers — 1924 GB and 2 MB — are correct; only
+one of them is about this machine.
+
+Kept behind `FGM_BLOCKED_ATTN=1` rather than deleted. It is the path that wins
+once K/V genuinely exceeds L2 (much longer context, or E4B's two KV heads), and
+re-deriving it later costs more than carrying it. The A/B lives in
+`bench/ab_blocked.sh` so the next person does not have to rebuild it — the first
+version of that script was written in `/tmp` and lost.
+
+### The parallel GEMM preamble, measured
+
+The same runs pin down the preamble win (FWHT rotation, activation quantisation
+and A tile-packing, previously single-threaded while the GEMM itself was not):
+
+| ctx | before | after | gain |
+|---|---|---|---|
+| 2048 | 135.4 | 169.8 | +25% |
+| 4096 | 112.9 | 135.1 | +20% |
+| 8192 | 90.5 | 98.6 | +9% |
+
+Bit-exact against the serial path, since the work is per-row and the split
+preserves evaluation order — which is why bit-identity is a valid check *here*
+and not for anything that reorders float accumulation.

@@ -47,6 +47,41 @@ fn synth_tokens(n: usize, seed: u64) -> Vec<u32> {
         .collect()
 }
 
+/// Read a tool schema written as JSON, so the constraint is built from the same
+/// declaration the prompt carries rather than a synthetic stand-in.
+fn load_toolspec(path: &str) -> Vec<fgm_core::grammar::Tool> {
+    use fgm_core::grammar::{Param, ParamType, Tool};
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("toolspec")).expect("toolspec json");
+    v.as_array()
+        .expect("toolspec is a list of tools")
+        .iter()
+        .map(|t| Tool {
+            name: t["name"].as_str().expect("tool name").to_string(),
+            params: t["params"]
+                .as_array()
+                .expect("tool params")
+                .iter()
+                .map(|p| Param {
+                    name: p["name"].as_str().expect("param name").to_string(),
+                    ty: match p["type"].as_str().unwrap_or("STRING") {
+                        "INTEGER" => ParamType::Int,
+                        "NUMBER" => ParamType::Num,
+                        "BOOLEAN" => ParamType::Bool,
+                        _ => match p.get("enum").and_then(|e| e.as_array()) {
+                            Some(vals) => ParamType::Enum(
+                                vals.iter().map(|v| v.as_str().unwrap().to_string()).collect(),
+                            ),
+                            None => ParamType::Str,
+                        },
+                    },
+                    required: p.get("required").and_then(|r| r.as_bool()).unwrap_or(true),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 fn argmax(v: &[f32]) -> usize {
     let mut best = (0usize, f32::NEG_INFINITY);
     for (i, &x) in v.iter().enumerate() {
@@ -68,6 +103,9 @@ fn main() {
     let cfg = model.cfg.clone();
     eprintln!("model {} ({:.2} GB) mapped in {:?}", path,
               model.total_bytes() as f64 / 1e9, t0.elapsed());
+    eprintln!("  weights: {:?}{}", fgm_core::forward::WeightSel::from_env(),
+              if model.has("l0.q_proj.i8") { " (file carries int8 twins)" }
+              else { " (int4 only -- convert with --weights=both for twins)" });
     eprintln!("  H={} L={} heads={} kv={} hd={}/{} inter={} vocab={} threads={}",
               cfg.hidden_size, cfg.num_hidden_layers, cfg.num_attention_heads,
               cfg.num_key_value_heads, cfg.head_dim, cfg.global_head_dim,
@@ -163,14 +201,44 @@ fn main() {
                      caches[0].bytes() as f64 / 1e6, ctx);
             let mut r = Runner::new(&model, chunk.max(conc), ctx, threads());
 
-            // shared tool-definition prefix, then a per-request body
-            let prompts: Vec<Vec<u32>> = (0..conc).map(|i| synth_tokens(pin, 100 + i as u64)).collect();
+            // Shared tool-definition prefix, then a per-request body. FGM_SHARE
+            // is how many leading tokens every request has in common -- in the
+            // target profile that is the 12-tool declaration block, which is
+            // byte-identical across the 8 concurrent requests.
+            let share: usize = std::env::var("FGM_SHARE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let share = share.min(pin);
+            let common = synth_tokens(share, 7);
+            let prompts: Vec<Vec<u32>> = (0..conc)
+                .map(|i| {
+                    let mut p = common.clone();
+                    p.extend(synth_tokens(pin - share, 100 + i as u64));
+                    p
+                })
+                .collect();
 
             let t_all = Instant::now();
             let mut ttft = vec![0.0f64; conc];
             let t_pre = Instant::now();
-            for s in 0..conc {
+            let mut fork_s = 0.0f64;
+            if share > 0 {
+                // Prefill the common span once, then copy the cache into every
+                // other sequence. The copy is memcpy-bound; the prefill it
+                // replaces is not.
                 let mut off = 0;
+                while off < share {
+                    let n = chunk.min(share - off);
+                    r.forward(&common[off..off + n], off, &mut caches[0]);
+                    off += n;
+                }
+                let t = Instant::now();
+                let (head, tail) = caches.split_at_mut(1);
+                for c in tail.iter_mut() {
+                    c.fork_from(&head[0]);
+                }
+                fork_s = t.elapsed().as_secs_f64();
+            }
+            for s in 0..conc {
+                let mut off = share;
                 while off < pin {
                     let n = chunk.min(pin - off);
                     r.forward(&prompts[s][off..off + n], off, &mut caches[s]);
@@ -181,6 +249,10 @@ fn main() {
             let pre = t_pre.elapsed().as_secs_f64();
             println!("  prefill: {} tok in {:.2}s -> {:.1} tok/s aggregate",
                      conc * pin, pre, (conc * pin) as f64 / pre);
+            if share > 0 {
+                println!("  prefix sharing: {share} tok shared, {} prefill tok avoided, \
+                          fork {:.0} ms", (conc - 1) * share, fork_s * 1000.0);
+            }
 
             // batched decode: every GEMM serves all `conc` rows at once
             let mut toks: Vec<u32> = (0..conc).map(|i| 1000 + i as u32).collect();
@@ -471,6 +543,110 @@ fn main() {
                       toks.len(), ttft, out.len(), el - ttft,
                       out.len() as f64 / (el - ttft).max(1e-9));
             println!("{}", out.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","));
+        }
+
+        // Batched generation for the behavioural eval: one prompt per input
+        // line (comma-separated token ids), one line of generated ids out.
+        // Single process, so the model maps and the tile-state warm-up runs
+        // once instead of once per prompt.
+        //
+        // FGM_GRAMMAR=<tokenizer.json> turns on constrained decoding against
+        // the tool set in FGM_TOOLS/FGM_PARAMS, which is what makes structural
+        // validity a guarantee rather than a hope.
+        "genfile" => {
+            use fgm_core::grammar::{
+                load_vocab_bytes, synthetic_tools, Constraint, GrammarBuilder,
+            };
+            let ngen: usize = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(96);
+            let eos: Vec<u32> = std::env::var("FGM_EOS").ok()
+                .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+                .unwrap_or_else(|| vec![1, 106]);
+            let lines: Vec<Vec<u32>> = std::fs::read_to_string(&args[3]).expect("prompt file")
+                .lines().filter(|l| !l.trim().is_empty())
+                .map(|l| l.trim().split(',').map(|x| x.parse().unwrap()).collect())
+                .collect();
+            let chunk = 256usize;
+            let maxlen = lines.iter().map(|l| l.len()).max().unwrap_or(0);
+            let ctx = maxlen + ngen + 8;
+
+            let mut con = std::env::var("FGM_GRAMMAR").ok().map(|tj| {
+                let vocab = load_vocab_bytes(&std::fs::read_to_string(&tj).expect("tokenizer.json"));
+                // FGM_TOOLSPEC points at the same schema the prompt declares, so
+                // the constraint and the prompt cannot drift apart.
+                let tools = match std::env::var("FGM_TOOLSPEC") {
+                    Ok(p) => load_toolspec(&p),
+                    Err(_) => {
+                        let nt = std::env::var("FGM_TOOLS").ok().and_then(|v| v.parse().ok()).unwrap_or(12);
+                        let np = std::env::var("FGM_PARAMS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+                        synthetic_tools(nt, np)
+                    }
+                };
+                let c = Constraint::compile(GrammarBuilder::build(&tools), &vocab);
+                eprintln!("constrained decoding: {} tools, {} states", tools.len(), c.num_states());
+                c
+            });
+
+            let mut r = Runner::new(&model, chunk, ctx, threads());
+            let mut nprompt = 0usize;
+            let mut ngenerated = 0usize;
+            let mut forced_steps = 0usize;
+            let t_all = Instant::now();
+            for toks in &lines {
+                let mut cache = KvCache::new(&cfg, ctx, chunk);
+                if let Some(c) = con.as_mut() { c.reset(); }
+                let mut off = 0;
+                let mut tok = 0u32;
+                while off < toks.len() {
+                    let n = chunk.min(toks.len() - off);
+                    let lg = r.forward(&toks[off..off + n], off, &mut cache);
+                    if off + n >= toks.len() {
+                        tok = match con.as_ref() {
+                            Some(c) => {
+                                let mut v = lg.to_vec();
+                                c.apply(&mut v);
+                                argmax(&v) as u32
+                            }
+                            None => argmax(lg) as u32,
+                        };
+                    }
+                    off += n;
+                }
+                if let Some(c) = con.as_mut() { c.advance(tok as usize); }
+                let mut out = Vec::with_capacity(ngen);
+                let mut pos = toks.len();
+                for _ in 0..ngen {
+                    if eos.contains(&tok) { break; }
+                    out.push(tok);
+                    if con.as_ref().map(|c| c.done()).unwrap_or(false) { break; }
+                    // A forced step needs no logits at all -- the mask admits one
+                    // token, so the 201 MB LM-head read is skipped outright.
+                    if let Some(f) = con.as_ref().and_then(|c| c.forced()) {
+                        forced_steps += 1;
+                        r.forward_nolm(&[tok], pos, &mut cache);
+                        tok = f as u32;
+                        con.as_mut().unwrap().advance(f);
+                        pos += 1;
+                        continue;
+                    }
+                    let lg = r.forward(&[tok], pos, &mut cache);
+                    tok = match con.as_ref() {
+                        Some(c) => { let mut v = lg.to_vec(); c.apply(&mut v); argmax(&v) as u32 }
+                        None => argmax(lg) as u32,
+                    };
+                    if let Some(c) = con.as_mut() { c.advance(tok as usize); }
+                    pos += 1;
+                }
+                nprompt += toks.len();
+                ngenerated += out.len();
+                println!("{}", out.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","));
+            }
+            let el = t_all.elapsed().as_secs_f64();
+            eprintln!("{} prompts, {} prompt tok, {} generated tok in {:.2}s ({:.1} gen tok/s)",
+                      lines.len(), nprompt, ngenerated, el, ngenerated as f64 / el);
+            if con.is_some() {
+                eprintln!("forced steps (LM head skipped): {forced_steps}/{ngenerated} = {:.0}%",
+                          100.0 * forced_steps as f64 / ngenerated.max(1) as f64);
+            }
         }
 
         // Prefix sharing. The target profile is 8 concurrent requests that all

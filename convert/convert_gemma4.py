@@ -126,7 +126,7 @@ def rope_inv_freq(topo, layer_type):
 
 # ------------------------------------------------------------------ converter
 class Converter:
-    def __init__(self, src, out, bits, rotate, group=64):
+    def __init__(self, src, out, bits, rotate, group=64, dual=False):
         self.cfg = json.load(open(os.path.join(src, "config.json")))
         self.topo = Topo(self.cfg)
         self.st = SafeTensors(os.path.join(src, "model.safetensors"))
@@ -135,6 +135,11 @@ class Converter:
         self.bits = bits
         self.rotate = rotate
         self.group = group
+        # emit an int8 twin of every int4 layer GEMM so the runtime can pick
+        # per GEMM: int8 for compute-bound prefill, int4 for DRAM-bound decode.
+        # Only the FFN weights qualify -- the attention projections are already
+        # int8. 778 MB of int4 FFN weights become a 1.56 GB twin.
+        self.dual = dual
         self.err = {}
         self.t0 = time.time()
         self.out = out
@@ -143,13 +148,27 @@ class Converter:
     def f32(self, name, arr):
         return self.w.add(name, np.ascontiguousarray(arr, np.float32), "f32", shape=arr.shape)
 
-    def linear(self, name, key, bits, probe=False):
-        """Quantise + rotate + AMX-pack a Linear weight [out, in], streamed."""
+    def linear(self, name, key, bits, probe=False, dual=False):
+        """Quantise + rotate + AMX-pack a Linear weight [out, in], streamed.
+
+        `dual` additionally emits an int8 twin at `<name>.i8`. Prefill is
+        compute-bound and decode is DRAM-bound, so they want different weights:
+        int8 halves the accumulator drains an int4 group forces, while int4
+        halves the bytes a batch-1 step has to pull through DRAM. Carrying both
+        costs ~1.56 GB of file (an int8 twin is *twice* the int4 bytes, not the
+        same) and lets the runtime pick per GEMM.
+
+        The int8 twin is quantised from the same rotated chunk in the same pass
+        and buffered until the int4 stream closes, because the writer streams
+        one tensor at a time. The largest single weight here is 19 MB at int8.
+        """
         out, k = self.st.shape(key)
         rot = HAD if (self.rotate and k % HAD == 0) else 0
         dt = "q8c" if bits == 8 else "q4g"
+        dual = dual and bits == 4
         g = k // self.group
         scales = np.empty((out, g), np.float16) if bits == 4 else np.empty(out, np.float32)
+        alt_blobs, alt_scales = [], (np.empty(out, np.float32) if dual else None)
         # chunk rows so each chunk is a whole number of 16-row AMX n-blocks
         step = max(16, (1 << 24) // max(k, 1) // 16 * 16)
         self.w.begin(name, dt, [out, k],
@@ -169,11 +188,21 @@ class Converter:
                 sc = np.ascontiguousarray(sc.T)
             scales[r0:r1] = sc
             self.w.append(blob)
+            if dual:
+                ablob, asc = Q.quant_q8c(blk)
+                alt_blobs.append(ablob)
+                alt_scales[r0:r1] = asc
         e = self.w.end()
         if bits == 4:  # store transposed [k/group, out]: a tile's 16 scales are contiguous
             self.w.add(name + ".scale", np.ascontiguousarray(scales.T), "f16", shape=(g, out))
         else:
             self.w.add(name + ".scale", scales, "f32", shape=(out,))
+        if dual:
+            self.w.begin(name + ".i8", "q8c", [out, k], meta={"hadamard": rot, "group": 0})
+            for b in alt_blobs:
+                self.w.append(b)
+            self.w.end()
+            self.w.add(name + ".i8.scale", alt_scales, "f32", shape=(out,))
         if probe:
             self.err[name] = probed[0]
         return e
@@ -230,17 +259,17 @@ class Converter:
             self.f32(f"l{i}.layer_scalar", self.st.get(K(i, "layer_scalar")).reshape(1))
             self.f32(f"l{i}.q_norm", self.st.get(K(i, "self_attn.q_norm.weight")))
 
-            self.linear(f"l{i}.q_proj", K(i, "self_attn.q_proj.weight"), b["attn"])
-            self.linear(f"l{i}.o_proj", K(i, "self_attn.o_proj.weight"), b["attn"])
+            self.linear(f"l{i}.q_proj", K(i, "self_attn.q_proj.weight"), b["attn"], dual=self.dual)
+            self.linear(f"l{i}.o_proj", K(i, "self_attn.o_proj.weight"), b["attn"], dual=self.dual)
             if not shared:
                 self.f32(f"l{i}.k_norm", self.st.get(K(i, "self_attn.k_norm.weight")))
-                self.linear(f"l{i}.k_proj", K(i, "self_attn.k_proj.weight"), b["attn"])
-                self.linear(f"l{i}.v_proj", K(i, "self_attn.v_proj.weight"), b["attn"])
+                self.linear(f"l{i}.k_proj", K(i, "self_attn.k_proj.weight"), b["attn"], dual=self.dual)
+                self.linear(f"l{i}.v_proj", K(i, "self_attn.v_proj.weight"), b["attn"], dual=self.dual)
 
             pr = i in (0, t.L // 2, t.L - 1)
-            self.linear(f"l{i}.gate_proj", K(i, "mlp.gate_proj.weight"), b["ffn"], probe=pr)
-            self.linear(f"l{i}.up_proj", K(i, "mlp.up_proj.weight"), b["ffn"])
-            self.linear(f"l{i}.down_proj", K(i, "mlp.down_proj.weight"), b["ffn"], probe=pr)
+            self.linear(f"l{i}.gate_proj", K(i, "mlp.gate_proj.weight"), b["ffn"], probe=pr, dual=self.dual)
+            self.linear(f"l{i}.up_proj", K(i, "mlp.up_proj.weight"), b["ffn"], dual=self.dual)
+            self.linear(f"l{i}.down_proj", K(i, "mlp.down_proj.weight"), b["ffn"], probe=pr, dual=self.dual)
             self.linear(f"l{i}.per_layer_input_gate", K(i, "per_layer_input_gate.weight"), 8)
             self.linear(f"l{i}.per_layer_projection", K(i, "per_layer_projection.weight"), 8)
             if i % 5 == 0 or i == t.L - 1:
@@ -283,6 +312,9 @@ if __name__ == "__main__":
     ap.add_argument("--ple-bits", type=int, default=4)
     ap.add_argument("--emb-bits", type=int, default=4)
     ap.add_argument("--no-rotate", action="store_true")
+    ap.add_argument("--weights", choices=["int4", "both"], default="int4",
+                    help="'both' also stores an int8 twin of every int4 layer "
+                         "GEMM (+~1.56 GB) so prefill can run int8 and decode int4")
     ap.add_argument("--group", type=int, default=64,
                     help="int4 scale group along K (multiple of 64); larger is "
                          "faster (fewer accumulator drains), coarser, less accurate")
@@ -290,4 +322,4 @@ if __name__ == "__main__":
     print(f"converting {a.src} -> {a.out} (int4 group {a.group})")
     Converter(a.src, a.out,
               {"ffn": a.ffn_bits, "attn": a.attn_bits, "ple": a.ple_bits, "emb": a.emb_bits},
-              not a.no_rotate, a.group).run()
+              not a.no_rotate, a.group, a.weights == "both").run()

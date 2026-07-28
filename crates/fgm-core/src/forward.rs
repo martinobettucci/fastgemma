@@ -24,6 +24,70 @@ use crate::model::{Config, Model, QLinear};
 use crate::pool::{AttnJob, FaRow, GemmJob, Pool, PrepJob, RowRef};
 use fgm_kernels as k;
 
+/// A weight the file may carry in two quantisations.
+///
+/// Prefill and decode are different problems and want different weights. A
+/// prefill GEMM has hundreds of rows sharing one weight read, so it is
+/// compute-bound, and int4's per-group accumulator drain (every `group/64` tile
+/// steps) is the binding cost. A decode GEMM has one row per sequence, so the
+/// weight read itself is the cost and int4 halves the bytes. Measured
+/// standalone, group 256 int4 runs 2.19 TOPS against int8's ~3.9; measured at
+/// batch 1, int4 wins because nothing amortises the read.
+///
+/// `--weights=both` at conversion stores both (+~1.56 GB for E2B: an int8 twin
+/// is twice the int4 bytes) and the runtime picks per GEMM from the row count.
+pub struct DualW<'a> {
+    lo: QLinear<'a>,
+    hi: Option<QLinear<'a>>,
+}
+
+/// Which weight a GEMM should use, as a row-count threshold.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WeightSel {
+    /// always the file's primary (int4 where the converter wrote int4)
+    Lo,
+    /// always the int8 twin where one exists
+    Hi,
+    /// int8 once a GEMM has at least this many rows
+    Above(usize),
+}
+
+impl WeightSel {
+    /// `FGM_WEIGHTS=int4|int8|auto[:M]`, default `auto:16`.
+    ///
+    /// 16 is the AMX tile height: below it a GEMM cannot fill one tile of rows,
+    /// so it is decode-shaped no matter what the caller calls it.
+    pub fn from_env() -> Self {
+        match std::env::var("FGM_WEIGHTS").as_deref() {
+            Ok("int4") => WeightSel::Lo,
+            Ok("int8") => WeightSel::Hi,
+            Ok(s) if s.starts_with("auto:") => {
+                WeightSel::Above(s[5..].parse().unwrap_or(16))
+            }
+            _ => WeightSel::Above(16),
+        }
+    }
+}
+
+impl<'a> DualW<'a> {
+    pub fn new(lo: QLinear<'a>, hi: Option<QLinear<'a>>) -> Self {
+        DualW { lo, hi }
+    }
+
+    #[inline]
+    fn pick(&self, m: usize, sel: WeightSel) -> &QLinear<'a> {
+        match (&self.hi, sel) {
+            (Some(h), WeightSel::Hi) => h,
+            (Some(h), WeightSel::Above(t)) if m >= t => h,
+            _ => &self.lo,
+        }
+    }
+
+    pub fn has_hi(&self) -> bool {
+        self.hi.is_some()
+    }
+}
+
 /// Weights for one decoder layer, resolved once at construction.
 pub struct LayerW<'m> {
     pub input_ln: &'m [f32],
@@ -34,13 +98,13 @@ pub struct LayerW<'m> {
     pub q_norm: &'m [f32],
     pub k_norm: Option<&'m [f32]>,
     pub layer_scalar: f32,
-    pub q: QLinear<'m>,
-    pub o: QLinear<'m>,
-    pub kp: Option<QLinear<'m>>,
-    pub vp: Option<QLinear<'m>>,
-    pub gate: QLinear<'m>,
-    pub up: QLinear<'m>,
-    pub down: QLinear<'m>,
+    pub q: DualW<'m>,
+    pub o: DualW<'m>,
+    pub kp: Option<DualW<'m>>,
+    pub vp: Option<DualW<'m>>,
+    pub gate: DualW<'m>,
+    pub up: DualW<'m>,
+    pub down: DualW<'m>,
     pub ple_gate: QLinear<'m>,
     pub ple_proj: QLinear<'m>,
     pub head_dim: usize,
@@ -136,6 +200,8 @@ pub struct Runner<'m> {
     /// FGM_BLOCKED_ATTN=1 opts into the blocked path (off by default; see the
     /// gate in `forward_multi` for the measurements that put it there)
     blocked_attn: bool,
+    /// which of a dual-format weight's two quantisations each GEMM uses
+    pub wsel: WeightSel,
     /// Per-phase seconds, accumulated when FGM_PROFILE is set.
     pub prof: [f64; NPHASE],
     profiling: bool,
@@ -202,13 +268,13 @@ impl<'m> Runner<'m> {
                 q_norm: model.f32s(&format!("l{l}.q_norm")),
                 k_norm: (!shared).then(|| model.f32s(&format!("l{l}.k_norm"))),
                 layer_scalar: model.f32s(&format!("l{l}.layer_scalar"))[0],
-                q: model.linear(&format!("l{l}.q_proj")),
-                o: model.linear(&format!("l{l}.o_proj")),
-                kp: (!shared).then(|| model.linear(&format!("l{l}.k_proj"))),
-                vp: (!shared).then(|| model.linear(&format!("l{l}.v_proj"))),
-                gate: model.linear(&format!("l{l}.gate_proj")),
-                up: model.linear(&format!("l{l}.up_proj")),
-                down: model.linear(&format!("l{l}.down_proj")),
+                q: model.dual(&format!("l{l}.q_proj")),
+                o: model.dual(&format!("l{l}.o_proj")),
+                kp: (!shared).then(|| model.dual(&format!("l{l}.k_proj"))),
+                vp: (!shared).then(|| model.dual(&format!("l{l}.v_proj"))),
+                gate: model.dual(&format!("l{l}.gate_proj")),
+                up: model.dual(&format!("l{l}.up_proj")),
+                down: model.dual(&format!("l{l}.down_proj")),
                 ple_gate: model.linear(&format!("l{l}.per_layer_input_gate")),
                 ple_proj: model.linear(&format!("l{l}.per_layer_projection")),
                 head_dim: cfg.head_dim_of(l),
@@ -283,6 +349,7 @@ impl<'m> Runner<'m> {
                 m
             ],
             blocked_attn: std::env::var_os("FGM_BLOCKED_ATTN").is_some(),
+            wsel: WeightSel::from_env(),
             prof: [0.0; NPHASE],
             profiling: std::env::var_os("FGM_PROFILE").is_some(),
         }
@@ -299,6 +366,20 @@ impl<'m> Runner<'m> {
         let seq = vec![0usize; m];
         let pos: Vec<usize> = (pos0..pos0 + m).collect();
         self.forward_multi(tokens, &seq, &pos, std::slice::from_mut(kv), &[m - 1])
+    }
+
+    /// Forward that advances the KV cache but computes no logits.
+    ///
+    /// When a grammar constraint admits exactly one token, the next token is
+    /// already known and the 201 MB int4 LM-head read produces an answer nobody
+    /// reads. The rest of the layer stack still has to run, because the cache
+    /// must carry this position. On a 12-tool schema that is 42% of the steps
+    /// inside a tool call.
+    pub fn forward_nolm(&mut self, tokens: &[u32], pos0: usize, kv: &mut KvCache) {
+        let m = tokens.len();
+        let seq = vec![0usize; m];
+        let pos: Vec<usize> = (pos0..pos0 + m).collect();
+        self.forward_multi(tokens, &seq, &pos, std::slice::from_mut(kv), &[]);
     }
 
     /// Batched forward. Row `r` carries `tokens[r]` for sequence `seq[r]` at
@@ -323,6 +404,7 @@ impl<'m> Runner<'m> {
         );
         let model = self.model;
         let cfg = &self.cfg;
+        let wsel = self.wsel;
         let (hs, m) = (cfg.hidden_size, tokens.len());
         let (nl, pd) = (cfg.num_hidden_layers, cfg.hidden_size_per_layer_input);
         let (nh, kvh) = (cfg.num_attention_heads, cfg.num_key_value_heads);
@@ -402,7 +484,7 @@ impl<'m> Runner<'m> {
             }
             tock!(_t, prof, 2);
             let _t = tick!(profiling);
-            gm.run(&self.pool, &w.q, &b.xn, m, hs, &mut b.q);
+            gm.run(&self.pool, w.q.pick(m, wsel), &b.xn, m, hs, &mut b.q);
             tock!(_t, prof, 3);
             let _t = tick!(profiling);
             for r in 0..m {
@@ -417,8 +499,8 @@ impl<'m> Runner<'m> {
 
             if !w.shared {
                 let _t = tick!(profiling);
-                gm.run(&self.pool, w.kp.as_ref().unwrap(), &b.xn, m, hs, &mut b.kbuf);
-                gm.run(&self.pool, w.vp.as_ref().unwrap(), &b.xn, m, hs, &mut b.vbuf);
+                gm.run(&self.pool, w.kp.as_ref().unwrap().pick(m, wsel), &b.xn, m, hs, &mut b.kbuf);
+                gm.run(&self.pool, w.vp.as_ref().unwrap().pick(m, wsel), &b.xn, m, hs, &mut b.vbuf);
                 tock!(_t, prof, 3);
                 let _t = tick!(profiling);
                 let rl = caches[0].layers[l].as_ref().unwrap().row_len();
@@ -506,7 +588,7 @@ impl<'m> Runner<'m> {
             tock!(_t, prof, 5);
 
             let _t = tick!(profiling);
-            gm.run(&self.pool, &w.o, &b.ao, m, nh * hd, &mut b.proj);
+            gm.run(&self.pool, w.o.pick(m, wsel), &b.ao, m, nh * hd, &mut b.proj);
             for r in 0..m {
                 let (a, z) = (r * hs, (r + 1) * hs);
                 b.tmp[..hs].copy_from_slice(&b.proj[a..z]);
@@ -522,10 +604,10 @@ impl<'m> Runner<'m> {
                 b.tmp[..hs].copy_from_slice(&b.h[a..z]);
                 k::rmsnorm(&mut b.xn[a..z], &b.tmp[..hs], w.pre_ffn_ln, eps);
             }
-            gm.run(&self.pool, &w.gate, &b.xn, m, hs, &mut b.g);
-            gm.run(&self.pool, &w.up, &b.xn, m, hs, &mut b.u);
+            gm.run(&self.pool, w.gate.pick(m, wsel), &b.xn, m, hs, &mut b.g);
+            gm.run(&self.pool, w.up.pick(m, wsel), &b.xn, m, hs, &mut b.u);
             k::gelu_mul(&mut b.act, &b.g, &b.u, m * w.inter);
-            gm.run(&self.pool, &w.down, &b.act, m, w.inter, &mut b.proj);
+            gm.run(&self.pool, w.down.pick(m, wsel), &b.act, m, w.inter, &mut b.proj);
             for r in 0..m {
                 let (a, z) = (r * hs, (r + 1) * hs);
                 b.tmp[..hs].copy_from_slice(&b.proj[a..z]);
@@ -586,9 +668,14 @@ impl<'m> Runner<'m> {
             for (i, &r) in logit_rows.iter().enumerate() {
                 b.xn[i * hs..(i + 1) * hs].copy_from_slice(&b.h[r * hs..(r + 1) * hs]);
             }
-            gm.run(&self.pool, &self.lm_head, &b.xn, nr, hs, &mut b.logits);
+            // nr == 0 is a deliberate caller request to skip the head entirely
+            // (see `forward_nolm`), not a degenerate case to push through the
+            // GEMM.
+            if nr > 0 {
+                gm.run(&self.pool, &self.lm_head, &b.xn, nr, hs, &mut b.logits);
+            }
         }
-        if let Some(cap) = cfg.final_logit_softcapping {
+        if let (Some(cap), false) = (cfg.final_logit_softcapping, logit_rows.is_empty()) {
             let n = logit_rows.len() * self.cfg.vocab_size;
             k::softcap(&mut self.b.logits[..n], cap);
         }
