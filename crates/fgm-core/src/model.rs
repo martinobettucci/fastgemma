@@ -169,6 +169,8 @@ impl Model {
         let e = self.entry(name);
         let (n, k) = (e.shape[0], e.shape[1]);
         let had = e.meta.get("hadamard").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        // int4 scale group along K; set by the converter's --group
+        let grp = e.meta.get("group").and_then(|v| v.as_u64()).unwrap_or(64) as usize;
         static EMPTY_U8: &[u8] = &[];
         static EMPTY_I8: &[i8] = &[];
         static EMPTY_F16: &[F16] = &[];
@@ -178,7 +180,7 @@ impl Model {
                 bits: 4, n, k,
                 q4: self.u8s(name), q8: EMPTY_I8,
                 s4: self.f16s(&format!("{name}.scale")), s8: EMPTY_F32,
-                group: 64, hadamard: had,
+                group: grp, hadamard: had,
             },
             "q8c" => QLinear {
                 bits: 8, n, k,

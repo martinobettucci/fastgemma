@@ -259,6 +259,9 @@ void fgm_softcap(float *x, int n, float cap) {
 }
 
 // ---------------------------------------------------------------- attention
+void fgm_attend_q8_heads(float *, const float *, const int8_t *, const float *,
+                         const int8_t *, const float *, int, int, int, int, int,
+                         float *, int, int);
 // One query row against a contiguous int8 KV cache for one layer.
 //   k_cache / v_cache: [n_ctx, kv_heads * head_dim] int8 with per-(pos) scale
 //   q: [n_heads, head_dim] f32
@@ -268,9 +271,18 @@ void fgm_softcap(float *x, int n, float cap) {
 void fgm_attend_q8(float *out, const float *q, const int8_t *kc, const float *ks,
                    const int8_t *vc, const float *vs, int n_heads, int kv_heads,
                    int head_dim, int start, int end, float *scratch) {
+  fgm_attend_q8_heads(out, q, kc, ks, vc, vs, n_heads, kv_heads, head_dim,
+                      start, end, scratch, 0, n_heads);
+}
+
+// Same, restricted to heads [h0, h1) so the work can be split across threads.
+void fgm_attend_q8_heads(float *out, const float *q, const int8_t *kc, const float *ks,
+                         const int8_t *vc, const float *vs, int n_heads, int kv_heads,
+                         int head_dim, int start, int end, float *scratch,
+                         int h0, int h1) {
   const int kvd = kv_heads * head_dim;
   const int grp = n_heads / kv_heads;
-  for (int h = 0; h < n_heads; h++) {
+  for (int h = h0; h < h1; h++) {
     const float *qh = q + (size_t)h * head_dim;
     const int kvh = h / grp;
     float *sc = scratch;

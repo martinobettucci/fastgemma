@@ -126,7 +126,7 @@ def rope_inv_freq(topo, layer_type):
 
 # ------------------------------------------------------------------ converter
 class Converter:
-    def __init__(self, src, out, bits, rotate):
+    def __init__(self, src, out, bits, rotate, group=64):
         self.cfg = json.load(open(os.path.join(src, "config.json")))
         self.topo = Topo(self.cfg)
         self.st = SafeTensors(os.path.join(src, "model.safetensors"))
@@ -134,6 +134,7 @@ class Converter:
         self.w.start_body(header_reserve=1 << 21)
         self.bits = bits
         self.rotate = rotate
+        self.group = group
         self.err = {}
         self.t0 = time.time()
         self.out = out
@@ -147,11 +148,12 @@ class Converter:
         out, k = self.st.shape(key)
         rot = HAD if (self.rotate and k % HAD == 0) else 0
         dt = "q8c" if bits == 8 else "q4g"
-        g = k // Q.GROUP
+        g = k // self.group
         scales = np.empty((out, g), np.float16) if bits == 4 else np.empty(out, np.float32)
         # chunk rows so each chunk is a whole number of 16-row AMX n-blocks
         step = max(16, (1 << 24) // max(k, 1) // 16 * 16)
-        self.w.begin(name, dt, [out, k], meta={"hadamard": rot})
+        self.w.begin(name, dt, [out, k],
+                     meta={"hadamard": rot, "group": self.group if bits == 4 else 0})
         probed = None
         for r0 in range(0, out, step):
             r1 = min(out, r0 + step)
@@ -159,16 +161,16 @@ class Converter:
             if rot:
                 blk = Q.apply_hadamard_k(blk, rot)
             if probe and probed is None:
-                probed = (Q.rel_err(blk, dt), blk.shape)
+                probed = (Q.rel_err(blk, dt, self.group), blk.shape)
             if bits == 8:
                 blob, sc = Q.quant_q8c(blk)
             else:
-                blob, sc = Q.quant_q4g(blk)   # sc is [g, rows]
+                blob, sc = Q.quant_q4g(blk, self.group)   # sc is [g, rows]
                 sc = np.ascontiguousarray(sc.T)
             scales[r0:r1] = sc
             self.w.append(blob)
         e = self.w.end()
-        if bits == 4:  # store transposed [g, out]: a tile's 16 scales are contiguous
+        if bits == 4:  # store transposed [k/group, out]: a tile's 16 scales are contiguous
             self.w.add(name + ".scale", np.ascontiguousarray(scales.T), "f16", shape=(g, out))
         else:
             self.w.add(name + ".scale", scales, "f32", shape=(out,))
@@ -260,6 +262,7 @@ class Converter:
             "embed_scale": math.sqrt(t.H), "ple_embed_scale": math.sqrt(t.ple_dim),
             "ple_model_projection_scale": t.H ** -0.5, "ple_input_scale": 2.0 ** -0.5,
             "hadamard": HAD if self.rotate else 0,
+            "group": self.group,
             "quant": dict(self.bits),
         }
         self.w.meta.update({"convert_s": round(time.time() - self.t0, 1),
@@ -280,8 +283,11 @@ if __name__ == "__main__":
     ap.add_argument("--ple-bits", type=int, default=4)
     ap.add_argument("--emb-bits", type=int, default=4)
     ap.add_argument("--no-rotate", action="store_true")
+    ap.add_argument("--group", type=int, default=64,
+                    help="int4 scale group along K (multiple of 64); larger is "
+                         "faster (fewer accumulator drains), coarser, less accurate")
     a = ap.parse_args()
-    print(f"converting {a.src} -> {a.out}")
+    print(f"converting {a.src} -> {a.out} (int4 group {a.group})")
     Converter(a.src, a.out,
               {"ffn": a.ffn_bits, "attn": a.attn_bits, "ple": a.ple_bits, "emb": a.emb_bits},
-              not a.no_rotate).run()
+              not a.no_rotate, a.group).run()

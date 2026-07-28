@@ -13,334 +13,508 @@
 //! Every linear was Hadamard-rotated along K by the converter, so activations
 //! get the matching FWHT before quantising to int8 — that is what keeps the
 //! per-token activation scale off the outliers.
+//!
+//! All weights are resolved once into `LayerW` and all scratch is preallocated:
+//! the hot path does no string formatting, no map lookups and no allocation.
+
+use std::time::Instant;
 
 use crate::kv::KvCache;
 use crate::model::{Config, Model, QLinear};
+use crate::pool::{AttnJob, GemmJob, Pool, RowRef};
 use fgm_kernels as k;
 
-pub struct Scratch {
-    pub h: Vec<f32>,      // [M, H] residual stream
-    pub xn: Vec<f32>,     // [M, H] normed input
-    pub rot: Vec<f32>,    // [M, Kmax] rotated activation
-    pub qa: Vec<i8>,      // [M, Kmax] quantised activation
-    pub qs: Vec<f32>,     // [M] activation scales
-    pub pa: Vec<i8>,      // tile-packed activation
-    pub y: Vec<f32>,      // [M, Nmax] GEMM output
-    pub y2: Vec<f32>,     // [M, Nmax] second GEMM output (up_proj)
-    pub attn: Vec<f32>,   // [M, nh*hd]
-    pub kv: Vec<f32>,     // [kv_heads*hd]
-    pub ple: Vec<f32>,    // [M, L, 256]
-    pub ple_raw: Vec<f32>,// [L*256]
-    pub sc: Vec<f32>,     // attention softmax scratch
-    pub logits: Vec<f32>,
+/// Weights for one decoder layer, resolved once at construction.
+pub struct LayerW<'m> {
+    pub input_ln: &'m [f32],
+    pub post_attn_ln: &'m [f32],
+    pub pre_ffn_ln: &'m [f32],
+    pub post_ffn_ln: &'m [f32],
+    pub post_ple_ln: &'m [f32],
+    pub q_norm: &'m [f32],
+    pub k_norm: Option<&'m [f32]>,
+    pub layer_scalar: f32,
+    pub q: QLinear<'m>,
+    pub o: QLinear<'m>,
+    pub kp: Option<QLinear<'m>>,
+    pub vp: Option<QLinear<'m>>,
+    pub gate: QLinear<'m>,
+    pub up: QLinear<'m>,
+    pub down: QLinear<'m>,
+    pub ple_gate: QLinear<'m>,
+    pub ple_proj: QLinear<'m>,
+    pub head_dim: usize,
+    pub inter: usize,
+    pub sliding: bool,
+    pub shared: bool,
+    pub kv_src: usize,
 }
 
-impl Scratch {
-    pub fn new(cfg: &Config, max_tokens: usize, max_ctx: usize) -> Self {
-        let h = cfg.hidden_size;
-        let l = cfg.num_hidden_layers;
-        let nmax = cfg
-            .layer_types
-            .iter()
-            .enumerate()
-            .map(|(i, _)| cfg.inter_of(i).max(cfg.num_attention_heads * cfg.head_dim_of(i)))
-            .max()
-            .unwrap()
-            .max(l * cfg.hidden_size_per_layer_input);
-        let kmax = nmax.max(h);
-        let m = max_tokens;
-        Scratch {
-            h: vec![0.0; m * h],
-            xn: vec![0.0; m * h],
-            rot: vec![0.0; m * kmax],
-            qa: vec![0; m * kmax],
-            qs: vec![0.0; m + 16],
-            pa: vec![0; k::packed_a_len(m, kmax)],
-            y: vec![0.0; m * nmax],
-            y2: vec![0.0; m * nmax],
-            attn: vec![0.0; m * cfg.num_attention_heads * cfg.global_head_dim],
-            kv: vec![0.0; cfg.num_key_value_heads * cfg.global_head_dim],
-            ple: vec![0.0; m * l * cfg.hidden_size_per_layer_input],
-            ple_raw: vec![0.0; l * cfg.hidden_size_per_layer_input],
-            sc: vec![0.0; max_ctx + 64],
-            logits: vec![0.0; cfg.vocab_size],
+/// Scratch for the GEMM wrapper, kept separate so it can be borrowed disjointly
+/// from the activation buffers.
+struct Gemm {
+    rot: Vec<f32>,
+    qa: Vec<i8>,
+    qs: Vec<f32>,
+    pa: Vec<i8>,
+}
+
+impl Gemm {
+    /// `out[m, 0..w.n) = w . a[m, 0..w.k)`: rotate, quantise, tile-pack, dispatch.
+    fn run(&mut self, pool: &Pool, w: &QLinear, a: &[f32], m: usize, lda: usize, out: &mut [f32]) {
+        let (kk, n) = (w.k, w.n);
+        if lda == kk {
+            self.rot[..m * kk].copy_from_slice(&a[..m * kk]);
+        } else {
+            for r in 0..m {
+                self.rot[r * kk..(r + 1) * kk].copy_from_slice(&a[r * lda..r * lda + kk]);
+            }
         }
+        if w.hadamard > 0 {
+            k::fwht(&mut self.rot[..m * kk], w.hadamard);
+        }
+        k::quant_act(&self.rot[..m * kk], m, kk, &mut self.qa, &mut self.qs);
+        k::pack_a(m, kk, &self.qa, &mut self.pa);
+        pool.gemm(GemmJob {
+            m,
+            n,
+            kdim: kk,
+            a: self.pa.as_ptr(),
+            a_scale: self.qs.as_ptr(),
+            bq: w.q4.as_ptr(),
+            b8: w.q8.as_ptr(),
+            s4: w.s4.as_ptr(),
+            s8: w.s8.as_ptr(),
+            bits: w.bits,
+            group: if w.group == 0 { 64 } else { w.group },
+            c: out.as_mut_ptr(),
+            ldc: n,
+        });
     }
+}
+
+/// Preallocated activation buffers.
+struct Buf {
+    h: Vec<f32>,
+    xn: Vec<f32>,
+    q: Vec<f32>,
+    kbuf: Vec<f32>,
+    vbuf: Vec<f32>,
+    ao: Vec<f32>,
+    proj: Vec<f32>,
+    g: Vec<f32>,
+    u: Vec<f32>,
+    act: Vec<f32>,
+    p: Vec<f32>,
+    pout: Vec<f32>,
+    ple: Vec<f32>,
+    ple_raw: Vec<f32>,
+    ple_proj: Vec<f32>,
+    tmp: Vec<f32>,
+    sc: Vec<f32>,
+    logits: Vec<f32>,
 }
 
 pub struct Runner<'m> {
     pub model: &'m Model,
-    pub s: Scratch,
-    inv_full: Vec<f32>,
-    inv_slide: Vec<f32>,
-    /// per-layer hidden states, captured only when FGM_DUMP is set
+    pub cfg: Config,
+    pub pool: Pool,
+    layers: Vec<LayerW<'m>>,
+    lm_head: QLinear<'m>,
+    ple_model_proj: QLinear<'m>,
+    ple_norm: &'m [f32],
+    final_norm: &'m [f32],
+    inv_full: &'m [f32],
+    inv_slide: &'m [f32],
+    gm: Gemm,
+    b: Buf,
     dump: Vec<f32>,
+    /// Per-row KV view, rebuilt each layer (cheap: m entries).
+    rows: Vec<RowRef>,
+    seq_buf: Vec<usize>,
+    pos_buf: Vec<usize>,
+    /// Per-phase seconds, accumulated when FGM_PROFILE is set.
+    pub prof: [f64; NPHASE],
+    profiling: bool,
+}
+
+pub const NPHASE: usize = 10;
+pub const PHASE_NAMES: [&str; NPHASE] = [
+    "embed", "ple", "norms", "qkv_gemm", "qk_norm_rope", "attention",
+    "o_gemm", "ffn_gemm", "ple_inject", "lm_head",
+];
+
+/// Wall-clock helpers. These accumulate into a local array so they compose with
+/// the disjoint `&mut self.gm` / `&mut self.b` borrows in the hot loop.
+macro_rules! tick {
+    ($on:expr) => {
+        if $on { Some(Instant::now()) } else { None }
+    };
+}
+macro_rules! tock {
+    ($t:expr, $prof:expr, $i:expr) => {
+        if let Some(t) = $t {
+            $prof[$i] += t.elapsed().as_secs_f64();
+        }
+    };
 }
 
 impl<'m> Runner<'m> {
-    pub fn new(model: &'m Model, max_tokens: usize, max_ctx: usize) -> Self {
+    pub fn new(model: &'m Model, max_tokens: usize, max_ctx: usize, threads: usize) -> Self {
         assert!(k::amx_init(), "AMX XTILEDATA permission denied");
-        let s = Scratch::new(&model.cfg, max_tokens, max_ctx);
+        let cfg = model.cfg.clone();
+        let (hs, nl) = (cfg.hidden_size, cfg.num_hidden_layers);
+        let pd = cfg.hidden_size_per_layer_input;
+
+        let mut layers = Vec::with_capacity(nl);
+        for l in 0..nl {
+            let shared = cfg.is_shared(l);
+            layers.push(LayerW {
+                input_ln: model.f32s(&format!("l{l}.input_layernorm")),
+                post_attn_ln: model.f32s(&format!("l{l}.post_attention_layernorm")),
+                pre_ffn_ln: model.f32s(&format!("l{l}.pre_feedforward_layernorm")),
+                post_ffn_ln: model.f32s(&format!("l{l}.post_feedforward_layernorm")),
+                post_ple_ln: model.f32s(&format!("l{l}.post_per_layer_input_norm")),
+                q_norm: model.f32s(&format!("l{l}.q_norm")),
+                k_norm: (!shared).then(|| model.f32s(&format!("l{l}.k_norm"))),
+                layer_scalar: model.f32s(&format!("l{l}.layer_scalar"))[0],
+                q: model.linear(&format!("l{l}.q_proj")),
+                o: model.linear(&format!("l{l}.o_proj")),
+                kp: (!shared).then(|| model.linear(&format!("l{l}.k_proj"))),
+                vp: (!shared).then(|| model.linear(&format!("l{l}.v_proj"))),
+                gate: model.linear(&format!("l{l}.gate_proj")),
+                up: model.linear(&format!("l{l}.up_proj")),
+                down: model.linear(&format!("l{l}.down_proj")),
+                ple_gate: model.linear(&format!("l{l}.per_layer_input_gate")),
+                ple_proj: model.linear(&format!("l{l}.per_layer_projection")),
+                head_dim: cfg.head_dim_of(l),
+                inter: cfg.inter_of(l),
+                sliding: cfg.is_sliding(l),
+                shared,
+                kv_src: cfg.kv_source(l),
+            });
+        }
+
+        let nh = cfg.num_attention_heads;
+        let kvh = cfg.num_key_value_heads;
+        let hdmax = cfg.head_dim.max(cfg.global_head_dim);
+        let imax = (0..nl).map(|l| cfg.inter_of(l)).max().unwrap();
+        let kmax = imax.max(hs).max(nh * hdmax);
+        let m = max_tokens;
+
         Runner {
-            inv_full: model.f32s("rope.full_attention.inv_freq").to_vec(),
-            inv_slide: model.f32s("rope.sliding_attention.inv_freq").to_vec(),
+            lm_head: model.linear("lm_head"),
+            ple_model_proj: model.linear("per_layer_model_projection"),
+            ple_norm: model.f32s("per_layer_projection_norm"),
+            final_norm: model.f32s("norm"),
+            inv_full: model.f32s("rope.full_attention.inv_freq"),
+            inv_slide: model.f32s("rope.sliding_attention.inv_freq"),
+            gm: Gemm {
+                rot: vec![0.0; m * kmax],
+                qa: vec![0; m * kmax],
+                qs: vec![0.0; m + 16],
+                pa: vec![0; k::packed_a_len(m, kmax)],
+            },
+            b: Buf {
+                h: vec![0.0; m * hs],
+                xn: vec![0.0; m * hs],
+                q: vec![0.0; m * nh * hdmax],
+                kbuf: vec![0.0; m * kvh * hdmax],
+                vbuf: vec![0.0; m * kvh * hdmax],
+                ao: vec![0.0; m * nh * hdmax],
+                proj: vec![0.0; m * hs],
+                g: vec![0.0; m * imax],
+                u: vec![0.0; m * imax],
+                act: vec![0.0; m * imax],
+                p: vec![0.0; m * pd],
+                pout: vec![0.0; m * hs],
+                ple: vec![0.0; m * nl * pd],
+                ple_raw: vec![0.0; nl * pd],
+                ple_proj: vec![0.0; nl * pd],
+                tmp: vec![0.0; hs.max(kmax)],
+                sc: vec![0.0; max_ctx + 64],
+                logits: vec![0.0; max_tokens.min(16) * cfg.vocab_size],
+            },
+            pool: Pool::new(threads, max_ctx + 64),
+            layers,
             model,
-            s,
+            cfg,
             dump: Vec::new(),
+            rows: vec![
+                RowRef {
+                    kc: std::ptr::null(), ks: std::ptr::null(),
+                    vc: std::ptr::null(), vs: std::ptr::null(),
+                    k_len: 0, pos: 0,
+                };
+                m
+            ],
+            seq_buf: Vec::with_capacity(m),
+            pos_buf: Vec::with_capacity(m),
+            prof: [0.0; NPHASE],
+            profiling: std::env::var_os("FGM_PROFILE").is_some(),
         }
     }
 
-    /// `out[m, 0..w.n) = w . a[m, 0..w.k)` for `m` rows.
+    /// Single-sequence convenience wrapper: contiguous positions, one cache,
+    /// logits for the final token only.
+    pub fn forward(&mut self, tokens: &[u32], pos0: usize, kv: &mut KvCache) -> &[f32] {
+        let m = tokens.len();
+        self.seq_buf.clear();
+        self.seq_buf.extend(std::iter::repeat(0).take(m));
+        self.pos_buf.clear();
+        self.pos_buf.extend(pos0..pos0 + m);
+        let (seq, pos) = (std::mem::take(&mut self.seq_buf), std::mem::take(&mut self.pos_buf));
+        let caches = std::slice::from_mut(kv);
+        let out = self.forward_multi(tokens, &seq, &pos, caches, &[m - 1]).as_ptr();
+        let n = self.cfg.vocab_size;
+        self.seq_buf = seq;
+        self.pos_buf = pos;
+        unsafe { std::slice::from_raw_parts(out, n) }
+    }
+
+    /// Batched forward. Row `r` carries `tokens[r]` for sequence `seq[r]` at
+    /// absolute position `pos[r]`. Every GEMM sees all rows at once, which is
+    /// the whole point: at batch 8 the weight traffic is amortised 8 ways while
+    /// attention stays per-sequence.
     ///
-    /// Applies the rotconv FWHT, quantises to int8 per row, tile-packs, then
-    /// dispatches to the int4 or int8 AMX kernel.
-    fn matmul(&mut self, w: &QLinear, a: &[f32], m: usize, lda: usize, out: &mut [f32]) {
-        let (kk, n) = (w.k, w.n);
-        for r in 0..m {
-            self.s.rot[r * kk..r * kk + kk].copy_from_slice(&a[r * lda..r * lda + kk]);
+    /// Returns `logit_rows.len() * vocab_size` logits, row-major.
+    pub fn forward_multi(
+        &mut self,
+        tokens: &[u32],
+        seq: &[usize],
+        pos: &[usize],
+        caches: &mut [KvCache],
+        logit_rows: &[usize],
+    ) -> &[f32] {
+        let model = self.model;
+        let cfg = &self.cfg;
+        let (hs, m) = (cfg.hidden_size, tokens.len());
+        let (nl, pd) = (cfg.num_hidden_layers, cfg.hidden_size_per_layer_input);
+        let (nh, kvh) = (cfg.num_attention_heads, cfg.num_key_value_heads);
+        let eps = cfg.rms_norm_eps;
+        let dumping = std::env::var_os("FGM_DUMP").is_some();
+        let profiling = self.profiling;
+        let mut prof = [0.0f64; NPHASE];
+        if dumping {
+            self.dump.clear();
         }
-        if w.hadamard > 0 {
-            k::fwht(&mut self.s.rot[..m * kk], w.hadamard);
+
+        let _t = tick!(profiling);
+        for (r, &t) in tokens.iter().enumerate() {
+            model.gather("embed_tokens", t as usize, &mut self.b.h[r * hs..(r + 1) * hs]);
+            k::scale(&mut self.b.h[r * hs..(r + 1) * hs], cfg.embed_scale);
         }
-        k::quant_act(&self.s.rot[..m * kk], m, kk, &mut self.s.qa, &mut self.s.qs);
-        k::pack_a(m, kk, &self.s.qa, &mut self.s.pa);
-        let nb = n / 16;
-        if w.bits == 4 {
-            k::gemm_q4g(m, n, kk, &self.s.pa, &self.s.qs, w.q4, w.s4, w.group, out, n, 0, nb);
-        } else {
-            k::gemm_q8c(m, n, kk, &self.s.pa, &self.s.qs, w.q8, w.s8, out, n, 0, nb);
-        }
-    }
+        tock!(_t, prof, 0);
 
-    /// Per-Layer Embedding inputs for one token:
-    ///   ple = (rmsnorm(proj(x) * H^-0.5) + table[tok] * sqrt(256)) * 2^-0.5
-    fn build_ple(&mut self, tok: u32, x_row: usize) {
-        let cfg = &self.model.cfg;
-        let (l, pd) = (cfg.num_hidden_layers, cfg.hidden_size_per_layer_input);
-        self.model.gather("embed_tokens_per_layer", tok as usize, &mut self.s.ple_raw);
-        k::scale(&mut self.s.ple_raw[..l * pd], cfg.ple_embed_scale);
-
-        let w = self.model.linear("per_layer_model_projection");
-        let hcopy: Vec<f32> = self.s.h[x_row * cfg.hidden_size..(x_row + 1) * cfg.hidden_size].to_vec();
-        let mut proj = vec![0.0f32; l * pd];
-        self.matmul(&w, &hcopy, 1, cfg.hidden_size, &mut proj);
-        k::scale(&mut proj, cfg.ple_model_projection_scale);
-
-        let norm = self.model.f32s("per_layer_projection_norm");
-        let dst = &mut self.s.ple[x_row * l * pd..(x_row + 1) * l * pd];
-        let mut tmp = vec![0.0f32; pd];
-        for li in 0..l {
-            k::rmsnorm(&mut tmp, &proj[li * pd..(li + 1) * pd], norm, cfg.rms_norm_eps);
-            for j in 0..pd {
-                dst[li * pd + j] = (tmp[j] + self.s.ple_raw[li * pd + j]) * cfg.ple_input_scale;
+        // ple = (rmsnorm(proj(x) * H^-0.5) + table[tok] * sqrt(pd)) * 2^-0.5
+        let _t = tick!(profiling);
+        {
+            let (gm, b) = (&mut self.gm, &mut self.b);
+            gm.run(&self.pool, &self.ple_model_proj, &b.h, m, hs, &mut b.ple);
+            for r in 0..m {
+                b.ple_proj[..nl * pd].copy_from_slice(&b.ple[r * nl * pd..(r + 1) * nl * pd]);
+                k::scale(&mut b.ple_proj[..nl * pd], cfg.ple_model_projection_scale);
+                model.gather("embed_tokens_per_layer", tokens[r] as usize, &mut b.ple_raw);
+                k::scale(&mut b.ple_raw[..nl * pd], cfg.ple_embed_scale);
+                for li in 0..nl {
+                    k::rmsnorm(&mut b.tmp[..pd], &b.ple_proj[li * pd..(li + 1) * pd],
+                               self.ple_norm, eps);
+                    let base = r * nl * pd + li * pd;
+                    for j in 0..pd {
+                        b.ple[base + j] = (b.tmp[j] + b.ple_raw[li * pd + j]) * cfg.ple_input_scale;
+                    }
+                }
             }
         }
-    }
-
-    /// Run `tokens` at `positions` (contiguous, appended to `kv`).
-    /// Returns logits for the final token.
-    pub fn forward(&mut self, tokens: &[u32], pos0: usize, kv: &mut KvCache) -> &[f32] {
-        self.dump.clear();
-        let cfg = self.model.cfg.clone();
-        let (hs, m) = (cfg.hidden_size, tokens.len());
-        let eps = cfg.rms_norm_eps;
-
-        // ---- embeddings + per-layer inputs
-        for (r, &t) in tokens.iter().enumerate() {
-            let mut row = vec![0.0f32; hs];
-            self.model.gather("embed_tokens", t as usize, &mut row);
-            k::scale(&mut row, cfg.embed_scale);
-            self.s.h[r * hs..(r + 1) * hs].copy_from_slice(&row);
-        }
-        for (r, &t) in tokens.iter().enumerate() {
-            self.build_ple(t, r);
-        }
-
-        let pd = cfg.hidden_size_per_layer_input;
-        let nl = cfg.num_hidden_layers;
+        tock!(_t, prof, 1);
 
         for l in 0..nl {
-            let hd = cfg.head_dim_of(l);
-            let nh = cfg.num_attention_heads;
-            let kvh = cfg.num_key_value_heads;
-            let inv: Vec<f32> = if cfg.is_sliding(l) { self.inv_slide.clone() } else { self.inv_full.clone() };
+            let w = &self.layers[l];
+            let hd = w.head_dim;
+            let inv = if w.sliding { self.inv_slide } else { self.inv_full };
+            let (gm, b) = (&mut self.gm, &mut self.b);
 
             // ---- attention
-            let iln = self.model.f32s(&format!("l{l}.input_layernorm")).to_vec();
+            let _t = tick!(profiling);
             for r in 0..m {
-                let (a, b) = (r * hs, (r + 1) * hs);
-                let src: Vec<f32> = self.s.h[a..b].to_vec();
-                k::rmsnorm(&mut self.s.xn[a..b], &src, &iln, eps);
+                let (a, z) = (r * hs, (r + 1) * hs);
+                b.tmp[..hs].copy_from_slice(&b.h[a..z]);
+                k::rmsnorm(&mut b.xn[a..z], &b.tmp[..hs], w.input_ln, eps);
             }
-
-            let wq = self.model.linear(&format!("l{l}.q_proj"));
-            let mut q = vec![0.0f32; m * nh * hd];
-            let xn = self.s.xn.clone();
-            self.matmul(&wq, &xn, m, hs, &mut q);
-            let qn = self.model.f32s(&format!("l{l}.q_norm")).to_vec();
-            let mut tmp = vec![0.0f32; hd];
+            tock!(_t, prof, 2);
+            let _t = tick!(profiling);
+            gm.run(&self.pool, &w.q, &b.xn, m, hs, &mut b.q);
+            tock!(_t, prof, 3);
+            let _t = tick!(profiling);
             for r in 0..m {
                 for h in 0..nh {
                     let o = r * nh * hd + h * hd;
-                    k::rmsnorm(&mut tmp, &q[o..o + hd], &qn, eps);
-                    q[o..o + hd].copy_from_slice(&tmp);
+                    b.tmp[..hd].copy_from_slice(&b.q[o..o + hd]);
+                    k::rmsnorm(&mut b.q[o..o + hd], &b.tmp[..hd], w.q_norm, eps);
                 }
-                k::rope(&mut q[r * nh * hd..(r + 1) * nh * hd], nh, hd, &inv, pos0 + r);
+                k::rope(&mut b.q[r * nh * hd..(r + 1) * nh * hd], nh, hd, inv, pos[r]);
             }
+            tock!(_t, prof, 4);
 
-            // ---- k/v (only layers that own a cache)
-            if !cfg.is_shared(l) {
-                let wk = self.model.linear(&format!("l{l}.k_proj"));
-                let wv = self.model.linear(&format!("l{l}.v_proj"));
-                let mut kk = vec![0.0f32; m * kvh * hd];
-                let mut vv = vec![0.0f32; m * kvh * hd];
-                self.matmul(&wk, &xn, m, hs, &mut kk);
-                self.matmul(&wv, &xn, m, hs, &mut vv);
-                let kn = self.model.f32s(&format!("l{l}.k_norm")).to_vec();
-                let lk = kv.layers[l].as_mut().unwrap();
-                let rl = lk.row_len();
+            if !w.shared {
+                let _t = tick!(profiling);
+                gm.run(&self.pool, w.kp.as_ref().unwrap(), &b.xn, m, hs, &mut b.kbuf);
+                gm.run(&self.pool, w.vp.as_ref().unwrap(), &b.xn, m, hs, &mut b.vbuf);
+                tock!(_t, prof, 3);
+                let _t = tick!(profiling);
+                let rl = caches[0].layers[l].as_ref().unwrap().row_len();
                 for r in 0..m {
+                    let lk = caches[seq[r]].layers[l].as_mut().unwrap();
                     for h in 0..kvh {
                         let o = r * kvh * hd + h * hd;
-                        k::rmsnorm(&mut tmp, &kk[o..o + hd], &kn, eps);
-                        kk[o..o + hd].copy_from_slice(&tmp);
-                        k::rmsnorm_noscale(&mut tmp, &vv[o..o + hd], hd, eps);
-                        vv[o..o + hd].copy_from_slice(&tmp);
+                        b.tmp[..hd].copy_from_slice(&b.kbuf[o..o + hd]);
+                        k::rmsnorm(&mut b.kbuf[o..o + hd], &b.tmp[..hd], w.k_norm.unwrap(), eps);
+                        b.tmp[..hd].copy_from_slice(&b.vbuf[o..o + hd]);
+                        k::rmsnorm_noscale(&mut b.vbuf[o..o + hd], &b.tmp[..hd], hd, eps);
                     }
-                    k::rope(&mut kk[r * kvh * hd..(r + 1) * kvh * hd], kvh, hd, &inv, pos0 + r);
-                    let slot = lk.slot(pos0 + r);
+                    k::rope(&mut b.kbuf[r * kvh * hd..(r + 1) * kvh * hd], kvh, hd, inv, pos[r]);
+                    let slot = lk.slot(pos[r]);
                     let mut s1 = [0.0f32; 1];
-                    k::quant_act(&kk[r * rl..(r + 1) * rl], 1, rl, &mut lk.k[slot * rl..(slot + 1) * rl], &mut s1);
+                    k::quant_act(&b.kbuf[r * rl..(r + 1) * rl], 1, rl,
+                                 &mut lk.k[slot * rl..(slot + 1) * rl], &mut s1);
                     lk.ks[slot] = s1[0];
-                    k::quant_act(&vv[r * rl..(r + 1) * rl], 1, rl, &mut lk.v[slot * rl..(slot + 1) * rl], &mut s1);
+                    k::quant_act(&b.vbuf[r * rl..(r + 1) * rl], 1, rl,
+                                 &mut lk.v[slot * rl..(slot + 1) * rl], &mut s1);
                     lk.vs[slot] = s1[0];
                 }
+                tock!(_t, prof, 4);
             }
 
-            // ---- attend against the source layer's cache
-            let src = cfg.kv_source(l);
-            let lk = kv.layers[src].as_ref().unwrap();
-            let mut ao = vec![0.0f32; m * nh * hd];
+            let _t = tick!(profiling);
             for r in 0..m {
-                let pos = pos0 + r;
-                let (mut st, en) = kv.window(&cfg, l, pos);
-                if lk.ring && en - st > lk.capacity {
-                    st = en - lk.capacity;
-                }
-                debug_assert!(!lk.ring, "ring windows need slot-mapped attention");
-                k::attend_q8(
-                    &mut ao[r * nh * hd..(r + 1) * nh * hd],
-                    &q[r * nh * hd..(r + 1) * nh * hd],
-                    &lk.k, &lk.ks, &lk.v, &lk.vs,
-                    nh, kvh, hd, st, en, &mut self.s.sc,
-                );
+                let lk = caches[seq[r]].layers[w.kv_src].as_ref().unwrap();
+                self.rows[r] = RowRef {
+                    kc: lk.k.as_ptr(),
+                    ks: lk.ks.as_ptr(),
+                    vc: lk.v.as_ptr(),
+                    vs: lk.vs.as_ptr(),
+                    k_len: lk.capacity,
+                    pos: pos[r],
+                };
             }
+            self.pool.attn(AttnJob {
+                out: b.ao.as_mut_ptr(),
+                q: b.q.as_ptr(),
+                rows: self.rows.as_ptr(),
+                nh,
+                kvh,
+                hd,
+                m,
+                window: if w.sliding { cfg.sliding_window } else { 0 },
+            });
 
-            let wo = self.model.linear(&format!("l{l}.o_proj"));
-            let mut proj = vec![0.0f32; m * hs];
-            self.matmul(&wo, &ao, m, nh * hd, &mut proj);
-            let pan = self.model.f32s(&format!("l{l}.post_attention_layernorm")).to_vec();
+            tock!(_t, prof, 5);
+
+            let _t = tick!(profiling);
+            gm.run(&self.pool, &w.o, &b.ao, m, nh * hd, &mut b.proj);
             for r in 0..m {
-                let (a, b) = (r * hs, (r + 1) * hs);
-                let src: Vec<f32> = proj[a..b].to_vec();
-                k::rmsnorm(&mut proj[a..b], &src, &pan, eps);
-                let (hh, pp) = (&mut self.s.h[a..b], &proj[a..b]);
-                k::add(hh, pp);
+                let (a, z) = (r * hs, (r + 1) * hs);
+                b.tmp[..hs].copy_from_slice(&b.proj[a..z]);
+                k::rmsnorm(&mut b.proj[a..z], &b.tmp[..hs], w.post_attn_ln, eps);
             }
+            k::add(&mut b.h[..m * hs], &b.proj[..m * hs]);
+            tock!(_t, prof, 6);
 
             // ---- MLP
-            let inter = cfg.inter_of(l);
-            let pfn = self.model.f32s(&format!("l{l}.pre_feedforward_layernorm")).to_vec();
+            let _t = tick!(profiling);
             for r in 0..m {
-                let (a, b) = (r * hs, (r + 1) * hs);
-                let src: Vec<f32> = self.s.h[a..b].to_vec();
-                k::rmsnorm(&mut self.s.xn[a..b], &src, &pfn, eps);
+                let (a, z) = (r * hs, (r + 1) * hs);
+                b.tmp[..hs].copy_from_slice(&b.h[a..z]);
+                k::rmsnorm(&mut b.xn[a..z], &b.tmp[..hs], w.pre_ffn_ln, eps);
             }
-            let xn = self.s.xn.clone();
-            let wg = self.model.linear(&format!("l{l}.gate_proj"));
-            let wu = self.model.linear(&format!("l{l}.up_proj"));
-            let mut g = vec![0.0f32; m * inter];
-            let mut u = vec![0.0f32; m * inter];
-            self.matmul(&wg, &xn, m, hs, &mut g);
-            self.matmul(&wu, &xn, m, hs, &mut u);
-            let mut act = vec![0.0f32; m * inter];
-            k::gelu_mul(&mut act, &g, &u, m * inter);
-            let wd = self.model.linear(&format!("l{l}.down_proj"));
-            let mut d = vec![0.0f32; m * hs];
-            self.matmul(&wd, &act, m, inter, &mut d);
-            let pff = self.model.f32s(&format!("l{l}.post_feedforward_layernorm")).to_vec();
+            gm.run(&self.pool, &w.gate, &b.xn, m, hs, &mut b.g);
+            gm.run(&self.pool, &w.up, &b.xn, m, hs, &mut b.u);
+            k::gelu_mul(&mut b.act, &b.g, &b.u, m * w.inter);
+            gm.run(&self.pool, &w.down, &b.act, m, w.inter, &mut b.proj);
             for r in 0..m {
-                let (a, b) = (r * hs, (r + 1) * hs);
-                let src: Vec<f32> = d[a..b].to_vec();
-                k::rmsnorm(&mut d[a..b], &src, &pff, eps);
-                let (hh, dd) = (&mut self.s.h[a..b], &d[a..b]);
-                k::add(hh, dd);
+                let (a, z) = (r * hs, (r + 1) * hs);
+                b.tmp[..hs].copy_from_slice(&b.proj[a..z]);
+                k::rmsnorm(&mut b.proj[a..z], &b.tmp[..hs], w.post_ffn_ln, eps);
             }
+            k::add(&mut b.h[..m * hs], &b.proj[..m * hs]);
+            tock!(_t, prof, 7);
 
             // ---- per-layer input injection
-            let wgate = self.model.linear(&format!("l{l}.per_layer_input_gate"));
-            let wproj = self.model.linear(&format!("l{l}.per_layer_projection"));
-            let hcopy = self.s.h[..m * hs].to_vec();
-            let mut p = vec![0.0f32; m * pd];
-            self.matmul(&wgate, &hcopy, m, hs, &mut p);
-            k::gelu(&mut p[..m * pd]);
+            let _t = tick!(profiling);
+            gm.run(&self.pool, &w.ple_gate, &b.h, m, hs, &mut b.p);
+            k::gelu(&mut b.p[..m * pd]);
             for r in 0..m {
                 let off = r * nl * pd + l * pd;
-                let (pr, pl) = (&mut p[r * pd..(r + 1) * pd], &self.s.ple[off..off + pd]);
-                k::mul(pr, pl);
+                for j in 0..pd {
+                    b.p[r * pd + j] *= b.ple[off + j];
+                }
             }
-            let mut pout = vec![0.0f32; m * hs];
-            self.matmul(&wproj, &p, m, pd, &mut pout);
-            let ppn = self.model.f32s(&format!("l{l}.post_per_layer_input_norm")).to_vec();
-            let lsc = self.model.f32s(&format!("l{l}.layer_scalar"))[0];
+            gm.run(&self.pool, &w.ple_proj, &b.p, m, pd, &mut b.pout);
             for r in 0..m {
-                let (a, b) = (r * hs, (r + 1) * hs);
-                let src: Vec<f32> = pout[a..b].to_vec();
-                k::rmsnorm(&mut pout[a..b], &src, &ppn, eps);
-                let (hh, pp) = (&mut self.s.h[a..b], &pout[a..b]);
-                k::add(hh, pp);
-                k::scale(&mut self.s.h[a..b], lsc);
+                let (a, z) = (r * hs, (r + 1) * hs);
+                b.tmp[..hs].copy_from_slice(&b.pout[a..z]);
+                k::rmsnorm(&mut b.pout[a..z], &b.tmp[..hs], w.post_ple_ln, eps);
             }
-            if std::env::var_os("FGM_DUMP").is_some() {
-                self.dump.extend_from_slice(&self.s.h[..m * hs]);
+            k::add(&mut b.h[..m * hs], &b.pout[..m * hs]);
+            k::scale(&mut b.h[..m * hs], w.layer_scalar);
+            tock!(_t, prof, 8);
+
+            if dumping {
+                self.dump.extend_from_slice(&self.b.h[..m * hs]);
             }
         }
 
-        // final norm, captured for validation before the LM head
-        if std::env::var_os("FGM_DUMP").is_some() {
-            let nrm0 = self.model.f32s("norm").to_vec();
-            let mut fin0 = vec![0.0f32; m * hs];
+        for r in 0..m {
+            let c = &mut caches[seq[r]];
+            c.len = c.len.max(pos[r] + 1);
+        }
+
+        // ---- final norm, then LM head for the requested rows.
+        // Batching the head is nearly free: it is a 201 MB int4 read that does
+        // not grow with m, so 8 rows cost about what 1 row costs.
+        let _t = tick!(profiling);
+        {
+            let (gm, b) = (&mut self.gm, &mut self.b);
+            let norm_all = dumping;
             for r in 0..m {
-                let src: Vec<f32> = self.s.h[r * hs..(r + 1) * hs].to_vec();
-                k::rmsnorm(&mut fin0[r * hs..(r + 1) * hs], &src, &nrm0, eps);
+                if !norm_all && !logit_rows.contains(&r) {
+                    continue;
+                }
+                let (a, z) = (r * hs, (r + 1) * hs);
+                b.tmp[..hs].copy_from_slice(&b.h[a..z]);
+                k::rmsnorm(&mut b.h[a..z], &b.tmp[..hs], self.final_norm, eps);
             }
-            self.dump.extend_from_slice(&fin0);
+            if dumping {
+                self.dump.extend_from_slice(&b.h[..m * hs]);
+            }
+            let nr = logit_rows.len();
+            for (i, &r) in logit_rows.iter().enumerate() {
+                b.xn[i * hs..(i + 1) * hs].copy_from_slice(&b.h[r * hs..(r + 1) * hs]);
+            }
+            gm.run(&self.pool, &self.lm_head, &b.xn, nr, hs, &mut b.logits);
         }
-        if let Ok(path) = std::env::var("FGM_DUMP") {
-            use std::io::Write;
-            let mut f = std::fs::File::create(&path).expect("dump");
-            f.write_all(&((nl + 1) as u32).to_le_bytes()).unwrap();
-            f.write_all(&(m as u32).to_le_bytes()).unwrap();
-            f.write_all(&(hs as u32).to_le_bytes()).unwrap();
-            for v in &self.dump { f.write_all(&v.to_le_bytes()).unwrap(); }
-            eprintln!("dumped {} layers x {m} x {hs} -> {path}", self.dump.len() / (m * hs));
-        }
-
-        kv.len = pos0 + m;
-
-        // ---- final norm + LM head for the last token only
-        let nrm = self.model.f32s("norm").to_vec();
-        let last = (m - 1) * hs;
-        let src: Vec<f32> = self.s.h[last..last + hs].to_vec();
-        let mut fin = vec![0.0f32; hs];
-        k::rmsnorm(&mut fin, &src, &nrm, eps);
-        let wl = self.model.linear("lm_head");
-        let mut logits = vec![0.0f32; cfg.vocab_size];
-        self.matmul(&wl, &fin, 1, hs, &mut logits);
         if let Some(cap) = cfg.final_logit_softcapping {
-            k::softcap(&mut logits, cap);
+            let n = logit_rows.len() * self.cfg.vocab_size;
+            k::softcap(&mut self.b.logits[..n], cap);
         }
-        self.s.logits.copy_from_slice(&logits);
-        &self.s.logits
+        tock!(_t, prof, 9);
+        for i in 0..NPHASE {
+            self.prof[i] += prof[i];
+        }
+
+        if dumping {
+            if let Ok(path) = std::env::var("FGM_DUMP") {
+                use std::io::Write;
+                let mut f = std::fs::File::create(&path).expect("dump");
+                f.write_all(&((nl + 1) as u32).to_le_bytes()).unwrap();
+                f.write_all(&(m as u32).to_le_bytes()).unwrap();
+                f.write_all(&(hs as u32).to_le_bytes()).unwrap();
+                for v in &self.dump {
+                    f.write_all(&v.to_le_bytes()).unwrap();
+                }
+                eprintln!("dumped {} entries -> {path}", self.dump.len() / (m * hs));
+            }
+        }
+        &self.b.logits[..logit_rows.len() * self.cfg.vocab_size]
     }
 }

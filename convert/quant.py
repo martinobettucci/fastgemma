@@ -146,18 +146,22 @@ def _q4_scale(wg):
     return best_s
 
 
-def quant_q4g(w):
-    """int4 symmetric per (output channel, 64-input group), AMX-tile packed.
+def quant_q4g(w, group=GROUP):
+    """int4 symmetric per (output channel, `group`-input group), AMX-tile packed.
 
-    Returns (packed_nibbles, scales[k/64, out] as f16).
+    `group` must be a multiple of TILE_K so a scale group covers whole AMX tiles;
+    the kernel drains its int32 accumulator every `group/64` tile steps, so this
+    is the speed/accuracy dial (see bench/kernels/gemm_bench).
+
+    Returns (packed_nibbles, scales[k/group, out] as f16).
     """
     out, k = w.shape
-    assert k % GROUP == 0
-    wg = w.reshape(out, -1, GROUP)
+    assert group % TILE_K == 0 and k % group == 0, (group, k)
+    wg = w.reshape(out, -1, group)
     scale = _q4_scale(wg)  # [out, g]
     q = np.clip(np.rint(wg / scale[:, :, None]), -8, 7).astype(np.int8).reshape(out, k)
     blob8 = pack_b_tiles(q, out, k)
-    # scales transposed to [g, out] so a tile's 16 scales are contiguous
+    # scales transposed to [k/group, out] so a tile's 16 scales are contiguous
     return pack_nibbles(blob8), np.ascontiguousarray(scale.T).astype(np.float16)
 
 
@@ -183,7 +187,7 @@ def quant_q4_rows(w, gs=GROUP):
 
 
 # ------------------------------------------------------------------ error probe
-def dequant_ref(w, fmt):
+def dequant_ref(w, fmt, group=GROUP):
     """Round-trip a weight through a format, for the conversion error report."""
     if fmt == "q8c":
         amax = np.abs(w).max(axis=1)
@@ -191,11 +195,11 @@ def dequant_ref(w, fmt):
         s = (amax / 127.0)[:, None]
         return np.clip(np.rint(w / s), -127, 127) * s
     out, k = w.shape
-    wg = w.reshape(out, -1, GROUP)
+    wg = w.reshape(out, -1, group)
     s = _q4_scale(wg).astype(np.float16).astype(np.float32)[:, :, None]
     return (np.clip(np.rint(wg / s), -8, 7) * s).reshape(out, k)
 
 
-def rel_err(w, fmt):
-    d = dequant_ref(w, fmt)
+def rel_err(w, fmt, group=GROUP):
+    d = dequant_ref(w, fmt, group)
     return float(np.linalg.norm(w - d) / (np.linalg.norm(w) + 1e-12))

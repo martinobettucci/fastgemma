@@ -41,6 +41,12 @@ extern "C" {
         vc: *const i8, vs: *const f32, n_heads: i32, kv_heads: i32,
         head_dim: i32, start: i32, end: i32, scratch: *mut f32,
     );
+    fn fgm_attend_q8_heads(
+        out: *mut f32, q: *const f32, kc: *const i8, ks: *const f32,
+        vc: *const i8, vs: *const f32, n_heads: i32, kv_heads: i32,
+        head_dim: i32, start: i32, end: i32, scratch: *mut f32,
+        h0: i32, h1: i32,
+    );
 }
 
 static AMX: Once = Once::new();
@@ -196,6 +202,26 @@ pub fn attend_q8(
             out.as_mut_ptr(), q.as_ptr(), kc.as_ptr(), ks.as_ptr(),
             vc.as_ptr(), vs.as_ptr(), n_heads as i32, kv_heads as i32,
             head_dim as i32, start as i32, end as i32, scratch.as_mut_ptr(),
+        )
+    }
+}
+
+/// Attention restricted to heads `[h0, h1)`, so the pool can split the work.
+/// `q` and `out` point at the first head in the range, not at head 0.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn attend_q8_heads(
+    out: &mut [f32], q: &[f32], kc: &[i8], ks: &[f32], vc: &[i8], vs: &[f32],
+    n_heads: usize, kv_heads: usize, head_dim: usize, start: usize, end: usize,
+    scratch: &mut [f32], h0: usize, h1: usize,
+) {
+    debug_assert!(scratch.len() >= end - start);
+    unsafe {
+        fgm_attend_q8_heads(
+            out.as_mut_ptr(), q.as_ptr(), kc.as_ptr(), ks.as_ptr(),
+            vc.as_ptr(), vs.as_ptr(), n_heads as i32, kv_heads as i32,
+            head_dim as i32, start as i32, end as i32, scratch.as_mut_ptr(),
+            h0 as i32, h1 as i32,
         )
     }
 }
