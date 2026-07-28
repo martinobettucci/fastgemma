@@ -1828,3 +1828,108 @@ steps are forced" and "11% of steps are collapsible" describe the same
 measurement. The first is what the instrument reported; the second is what the
 optimisation can actually take. The difference is entirely in the run-length
 distribution, which nobody thinks to ask for.
+
+---
+
+## 29. The AVX-512 VNNI backend
+
+The engine could not start without AMX — `Runner::new` asserted on the
+`XTILEDATA` grant — so a host without tile units meant no benchmarking at all,
+with two MTP paths sitting unmeasured. This adds a second GEMM implementation
+chosen at runtime, and the AMX kernels are not touched: `amx_gemm.c` keeps its
+entry points, `backend()` picks between them from CPUID, and `FGM_BACKEND=`
+forces either one on a host that has both.
+
+### Why the AMX weight layout needs no repacking
+
+This was the part I expected to be hard and wasn't. A B tile is 16 rows × 64
+bytes holding (K=64, N=16) as `[k/4][n][k%4]`. Read one of those 64-byte rows
+as a `__m512i` and 32-bit lane `n` contains the four bytes `B[4r+0..3][n]` —
+which is precisely the operand shape `vpdpbusd` consumes. **AMX tile order *is*
+VNNI order, chunked sixteen rows at a time.** The activation side is the
+broadcast operand, and GCC folds `_mm512_set1_epi32(*(int32_t*)p)` into the
+embedded broadcast, so the inner loop is `vpdpbusd zmm, zmm, dword [a]{1to16}`
+— one instruction per 64 MACs, no separate A load.
+
+The same is true of packed A, which is why `fgm_pack_a` moved to `ops.c`
+unchanged and both backends share it.
+
+### The signedness tax, and which side pays it
+
+`vpdpbusd` is unsigned × signed; both our operands are signed int8. One side
+must carry a +128 bias, and the correction is 128 × the sum of the *other* side
+over the same k range:
+
+    sum (B + 128)·A  =  sum B·A  +  128 · sum A
+
+Biasing **B** needs `sum A` — a per-row quantity computable here in O(M·K),
+using `vpdpbusd` against an all-ones operand so it costs 1/16th of the loop it
+corrects. Biasing **A** would need column sums of the *weights*, which are a
+property of the file and would mean touching the converter. So B pays: one
+`vpxorq` per tile row, amortised across all eight rows of the block.
+
+### Block shape: measured, not reasoned
+
+| shape | accumulators | per 16 MACs-wide step | M=8 | M=64 | M=1024 |
+|---|---|---|---|---|---|
+| 16 rows × 1 n-block | 16 | 16 bcast, 1 load, 1 xor | 120 | 89 | 81 |
+| **8 rows × 2 n-blocks** | 16 | 8 bcast, 2 loads, 2 xors | **152** | **156** | **143** |
+| 4 rows × 4 n-blocks | 16 | 4 bcast, 4 loads, 4 xors | 104 | 126 | 115 |
+
+int8 G MAC/s, single thread, K=1536 N=2048. The 16×1 shape looks equivalent —
+same sixteen accumulators — and is worst: GCC spills the accumulator array to
+the stack no matter how it is coaxed, and every multiply needs its own
+broadcast. Halving the broadcasts again with 4×4 makes it *worse*, so the
+binding constraint is B-side load/xor traffic, not broadcast count. 8×2 also
+happens to be the decode batch, and reading B once per eight rows rather than
+once per four matters at M=8 where decode is weight-read bound.
+
+### Two portability bugs that had nothing to do with AMX
+
+**`ops.c` SIGILL'd on a VNNI-only host** despite containing no tile
+instruction. At `-march=sapphirerapids` the single `_Float16` scale load in
+`fgm_gather_q4r` lowers to `vcvtsh2ss`, an AVX512-FP16 instruction. One line,
+in the one function nobody would think to check, in the file that was supposed
+to be the portable one. It now takes a raw `uint16_t` and widens with
+`_cvtsh_ss` (F16C), which is exact for every half value and therefore
+bit-identical. The build splits into a Sapphire Rapids TU holding `amx_gemm.c`
+alone and a Cascade Lake TU holding everything else.
+
+**`vnni_gemm.c` must build at `-O3`**, and only it. At `-O2` GCC declines the
+16-step unroll and spills: 63 G MAC/s against 143 for the same source. The
+`-O2` rule elsewhere exists to stop `-O3` sinking AVX stores past a
+`_tile_loadd`; there is no tile instruction in this file for it to sink past.
+
+**Trap 23 — "no AMX in this file" is not "runs without AMX".** ISA leakage is a
+property of the compile flags, not of the source. The only reliable check is to
+execute it on the target, which is exactly what could not be done while the
+engine refused to start.
+
+### The bug the unit test was written to miss
+
+The first version decoded a stored nibble as `v - 8`, the Q4_0 offset
+convention. The `.fgm` format is two's-complement 4-bit, `(v ^ 8) - 8` — what
+`unpack64` in `amx_gemm.c` has always done. Half the values were right, half
+were off by 16.
+
+Every int4 case in `vnni_test.c` reported **bit-identical** agreement. The
+kernel and its reference were written in the same sitting from the same wrong
+mental model, so their agreement measured nothing at all. The GEMM benchmark
+was equally blind — wrong values cost nothing in time.
+
+It surfaced on the first end-to-end run, as gibberish. The diagnostic that
+mattered: `FGM_WEIGHTS=int8` was *also* garbage, which ruled out "the int4 GEMM
+is broken and the int8 one is fine" and pointed at a shared int4 path — the LM
+head and PLE table have no int8 twin and stay int4 whatever the FFN does.
+
+The reference now decodes through a shared `nib()` and a
+`nibble_convention_is_twos_complement()` check pins all sixteen values to
+literals lifted from `unpack64`, so the mapping cannot drift on a formula I get
+wrong twice.
+
+**Trap 24 — a reference written by the same hand at the same time is not a
+reference.** It is a restatement. This is the second time in this project a
+check has been written to confirm rather than to contradict (the first was the
+u8 softmax weights, where the model *did* contradict and was right). The test
+that would have caught it is the one that pins a convention to literals taken
+from the other implementation, not to a formula re-derived from memory.
