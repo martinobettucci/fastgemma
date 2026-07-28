@@ -525,13 +525,48 @@ void fgm_attend_q8_heads(float *out, const float *q, const int8_t *kc, const flo
       memset(wq_hi + lo, 0, len);
       memset(wq_lo + lo, 0, len);
     }
-    for (int t = start; t < end; t++) {
-      int sl = KVSLOT(t);
-      int iw = (int)(sc[t - start] * inv * vs[sl] * wq_inv + 0.5f);
-      if (iw > 65535) iw = 65535;
-      if (iw < 0) iw = 0;
-      wq_hi[sl] = (uint8_t)(iw >> 8);
-      wq_lo[sl] = (uint8_t)(iw & 255);
+    // Vectorised weight fill. This ran scalar, and the attention ceiling probe
+    // showed why that mattered: at ctx 512 a scalar pass over the whole score
+    // range costs about as much as the entire Q.K^T dot product it feeds, since
+    // Q.K^T is 64 MACs per instruction while this was ~5 dependent scalar ops
+    // per position.
+    //
+    // Only the contiguous (non-ring) case vectorises directly: with a ring the
+    // slot index jumps at the wrap, so gather/scatter would be needed and the
+    // scalar path is kept. Ring layers are the sliding ones, whose range is
+    // capped at the 512-token window, so the loop that matters -- full-attention
+    // layers over thousands of positions -- is always the contiguous one.
+    if (!ring) {
+      const __m512 vscale = _mm512_set1_ps(inv * wq_inv);
+      int t = start;
+      for (; t + 16 <= end; t += 16) {
+        __m512 w = _mm512_mul_ps(_mm512_mul_ps(_mm512_loadu_ps(sc + t - start),
+                                               _mm512_loadu_ps(vs + t)), vscale);
+        __m512i iw = _mm512_cvtps_epi32(_mm512_roundscale_ps(
+            w, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        iw = _mm512_max_epi32(_mm512_min_epi32(iw, _mm512_set1_epi32(65535)),
+                              _mm512_setzero_si512());
+        _mm_storeu_si128((__m128i *)(wq_hi + t),
+                         _mm512_cvtepi32_epi8(_mm512_srli_epi32(iw, 8)));
+        _mm_storeu_si128((__m128i *)(wq_lo + t),
+                         _mm512_cvtepi32_epi8(_mm512_and_si512(iw, _mm512_set1_epi32(255))));
+      }
+      for (; t < end; t++) {
+        int iw = (int)(sc[t - start] * inv * vs[t] * wq_inv + 0.5f);
+        if (iw > 65535) iw = 65535;
+        if (iw < 0) iw = 0;
+        wq_hi[t] = (uint8_t)(iw >> 8);
+        wq_lo[t] = (uint8_t)(iw & 255);
+      }
+    } else {
+      for (int t = start; t < end; t++) {
+        int sl = KVSLOT(t);
+        int iw = (int)(sc[t - start] * inv * vs[sl] * wq_inv + 0.5f);
+        if (iw > 65535) iw = 65535;
+        if (iw < 0) iw = 0;
+        wq_hi[sl] = (uint8_t)(iw >> 8);
+        wq_lo[sl] = (uint8_t)(iw & 255);
+      }
     }
 
     for (int i = 0; i < head_dim; i += 16) {
