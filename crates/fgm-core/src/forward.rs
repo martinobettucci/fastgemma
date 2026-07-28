@@ -199,6 +199,8 @@ pub struct Runner<'m> {
     rows: Vec<RowRef>,
     /// which of a dual-format weight's two quantisations each GEMM uses
     pub wsel: WeightSel,
+    /// FGM_ROWBATCH=0|1 overrides the head-batching shape rule, for A/B
+    rowbatch_force: Option<bool>,
     /// FGM_KV4=1: simulate a 4-bit KV cache to measure its accuracy cost
     kv4: bool,
     /// Per-phase seconds, accumulated when FGM_PROFILE is set.
@@ -339,6 +341,7 @@ impl<'m> Runner<'m> {
                 m
             ],
             wsel: WeightSel::from_env(),
+            rowbatch_force: std::env::var("FGM_ROWBATCH").ok().map(|v| v != "0"),
             kv4: std::env::var_os("FGM_KV4").is_some(),
             prof: [0.0; NPHASE],
             profiling: std::env::var_os("FGM_PROFILE").is_some(),
@@ -574,12 +577,20 @@ impl<'m> Runner<'m> {
                 // amortisation wins. It also needs enough rows to split on,
                 // since one thread owns all heads of a row -- at decode (m=1)
                 // that would serialise attention entirely.
-                rowbatch: m >= 16
-                    && k::rowbatch_worthwhile(
+                // FGM_ROWBATCH=0|1 forces the path for A/B. Same binary, both
+                // arms, alternating -- the only design that survives this
+                // project's confounds: AMX corruption drift within a host
+                // (Trap 18) and, twice now, the host itself changing
+                // mid-session (2.10 -> 2.80 no-AMX -> 2.30 GHz).
+                rowbatch: match self.rowbatch_force {
+                    Some(v) => v && kvh == 1,
+                    None => m >= 16
+                        && k::rowbatch_worthwhile(
                         kvh,
                         hd,
                         if w.sliding { cfg.sliding_window.min(span) } else { span },
                     ),
+                },
             });
 
             tock!(_t, prof, 5);
