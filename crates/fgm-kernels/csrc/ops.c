@@ -310,7 +310,7 @@ void fgm_softcap(float *x, int n, float cap) {
 // ---------------------------------------------------------------- attention
 void fgm_attend_q8_heads(float *, const float *, const int8_t *, const float *,
                          const int8_t *, const float *, int, int, int, int, int,
-                         float *, int, int, int);
+                         float *, int, int, int, int);
 // One query row against a contiguous int8 KV cache for one layer.
 //   k_cache / v_cache: [n_ctx, kv_heads * head_dim] int8 with per-(pos) scale
 //   q: [n_heads, head_dim] f32
@@ -321,7 +321,7 @@ void fgm_attend_q8(float *out, const float *q, const int8_t *kc, const float *ks
                    const int8_t *vc, const float *vs, int n_heads, int kv_heads,
                    int head_dim, int start, int end, float *scratch) {
   fgm_attend_q8_heads(out, q, kc, ks, vc, vs, n_heads, kv_heads, head_dim,
-                      start, end, scratch, 0, n_heads, 0);
+                      start, end, scratch, 0, n_heads, 0, end);
 }
 
 // Same, restricted to heads [h0, h1) so the work can be split across threads.
@@ -335,7 +335,7 @@ void fgm_attend_q8(float *out, const float *q, const int8_t *kc, const float *ks
 void fgm_attend_q8_heads(float *out, const float *q, const int8_t *kc, const float *ks,
                          const int8_t *vc, const float *vs, int n_heads, int kv_heads,
                          int head_dim, int start, int end, float *scratch,
-                         int h0, int h1, int ring) {
+                         int h0, int h1, int ring, int cap) {
   const int kvd = kv_heads * head_dim;
   const int grp = n_heads / kv_heads;
 #define KVSLOT(t) ((ring) ? ((t) % (ring)) : (t))
@@ -445,17 +445,134 @@ void fgm_attend_q8_heads(float *out, const float *q, const int8_t *kc, const flo
     float sum = _mm512_reduce_add_ps(vsum);
     for (; u < n; u++) { sc[u] = expf(sc[u] - mx); sum += sc[u]; }
     float inv = 1.0f / sum;
-    float *oh = out + (size_t)h * head_dim;
-    for (int i = 0; i < head_dim; i += 16) _mm512_storeu_ps(oh + i, _mm512_setzero_ps());
+
+    // P.V in int8 with VNNI, against a transposed V cache.
+    //
+    // out[i] = sum_t w_t * v_t[i] is a scaled accumulate, not a dot product, so
+    // it cannot use vpdpbusd while V is stored [position][dim]. Stored instead
+    // as groups of four consecutive slots interleaved per dim --
+    //
+    //     vt[((slot/4) * kvd + j) * 4 + (slot%4)]
+    //
+    // -- the four bytes vpdpbusd multiplies and adds within each 32-bit lane
+    // are exactly four consecutive positions of one dim, so the reduction over
+    // positions falls out of the instruction. That is the VNNI/AMX B-tile
+    // layout; storing V this way is what makes P.V a GEMM.
+    //
+    // Weights are split across two u8 passes, giving 16-bit resolution:
+    //
+    //     iw = round(w * 65535 / wmax),  hi = iw >> 8,  lo = iw & 255
+    //     out = (wmax/65535) * (256 * sum hi*v + sum lo*v)
+    //
+    // One u8 pass was tried first and measured 2.90x the error the int8 cache
+    // already contributes -- worst on *flat* attention, which is exactly the
+    // long-context regime this work exists to speed up. The second pass reuses
+    // the same loaded V vector, so it costs two extra dpbusd and one extra
+    // accumulator per 16 dims, not a second pass over memory. Still ~6x fewer
+    // ops per MAC than the f32 version it replaces, against ~9.6x for single-u8.
+    //
+    // Accumulator bound: 255 * 127 * n_positions, so int32 is safe past 65k
+    // positions.
+    //
+    // Accumulators live in scratch rather than registers: head_dim 512 would
+    // need 32 zmm for one accumulator set alone. Sixteen slots (four groups)
+    // are processed per pass over the dims, so each accumulator is loaded and
+    // stored once per four vpdpbusd rather than once per one.
+    //
+    // Scratch layout, all sized off the cache capacity (slots are < cap, and a
+    // score range is never longer than the cache that holds it):
+    //   [0, cap)                    scores, already written above
+    //   [cap, ...)                  u8 weight highs, then lows, by slot
+    //   after that                  two int32 accumulator sets, head_dim each
+    const int wstride = (cap + 3) & ~3;
+    uint8_t *wq_hi = (uint8_t *)(scratch + cap);
+    uint8_t *wq_lo = wq_hi + wstride;
+    int32_t *acc_hi = (int32_t *)(scratch + cap + wstride / 2 + 4);
+    int32_t *acc_lo = acc_hi + head_dim;
+
+    float wmax = 0.0f;
     for (int t = start; t < end; t++) {
       float w = sc[t - start] * inv * vs[KVSLOT(t)];
-      if (w == 0.0f) continue;
-      const int8_t *vp = vc + (size_t)KVSLOT(t) * kvd + kvh * head_dim;
-      __m512 wv = _mm512_set1_ps(w);
+      if (w > wmax) wmax = w;
+    }
+    float *oh = out + (size_t)h * head_dim;
+    if (!(wmax > 0.0f)) {
+      for (int i = 0; i < head_dim; i += 16) _mm512_storeu_ps(oh + i, _mm512_setzero_ps());
+      continue;
+    }
+    const float wq_scale = wmax / 65535.0f, wq_inv = 65535.0f / wmax;
+
+    // Slot runs. Without a ring the slots are [start, end); with one they are
+    // that range modulo the capacity, which is at most two contiguous runs.
+    int run_lo[2], run_hi[2], nrun;
+    if (!ring) {
+      run_lo[0] = start; run_hi[0] = end; nrun = 1;
+    } else if (end - start >= ring) {
+      run_lo[0] = 0; run_hi[0] = ring; nrun = 1;
+    } else {
+      int s0 = start % ring, span = end - start;
+      if (s0 + span <= ring) { run_lo[0] = s0; run_hi[0] = s0 + span; nrun = 1; }
+      else {
+        run_lo[0] = s0; run_hi[0] = ring;
+        run_lo[1] = 0;  run_hi[1] = s0 + span - ring; nrun = 2;
+      }
+    }
+
+    // Zero each run's group-aligned span, so lanes outside the run contribute
+    // nothing and partial head/tail groups need no special case.
+    for (int rn = 0; rn < nrun; rn++) {
+      size_t lo = (size_t)(run_lo[rn] & ~3), len = (size_t)(((run_hi[rn] + 3) & ~3)) - lo;
+      memset(wq_hi + lo, 0, len);
+      memset(wq_lo + lo, 0, len);
+    }
+    for (int t = start; t < end; t++) {
+      int sl = KVSLOT(t);
+      int iw = (int)(sc[t - start] * inv * vs[sl] * wq_inv + 0.5f);
+      if (iw > 65535) iw = 65535;
+      if (iw < 0) iw = 0;
+      wq_hi[sl] = (uint8_t)(iw >> 8);
+      wq_lo[sl] = (uint8_t)(iw & 255);
+    }
+
+    for (int i = 0; i < head_dim; i += 16) {
+      _mm512_storeu_si512((void *)(acc_hi + i), _mm512_setzero_si512());
+      _mm512_storeu_si512((void *)(acc_lo + i), _mm512_setzero_si512());
+    }
+
+    const size_t gstride = (size_t)kvd * 4;
+    for (int rn = 0; rn < nrun; rn++) {
+      const int glo = run_lo[rn] & ~3, ghi = (run_hi[rn] + 3) & ~3;
+      for (int g = glo; g < ghi; g += 16) {
+        const int ng = (ghi - g >= 16) ? 4 : (ghi - g) / 4;
+        __m512i wh[4], wl[4];
+        for (int j = 0; j < 4; j++) {
+          wh[j] = j < ng ? _mm512_set1_epi32(*(const int32_t *)(wq_hi + g + 4 * j))
+                         : _mm512_setzero_si512();
+          wl[j] = j < ng ? _mm512_set1_epi32(*(const int32_t *)(wq_lo + g + 4 * j))
+                         : _mm512_setzero_si512();
+        }
+        const int8_t *v0 = vc + ((size_t)(g / 4) * kvd + (size_t)kvh * head_dim) * 4;
+        for (int i = 0; i < head_dim; i += 16) {
+          __m512i ah = _mm512_loadu_si512((const void *)(acc_hi + i));
+          __m512i al = _mm512_loadu_si512((const void *)(acc_lo + i));
+          const int8_t *vp = v0 + (size_t)i * 4;
+          for (int j = 0; j < ng; j++) {
+            __m512i vv = _mm512_loadu_si512((const void *)(vp + (size_t)j * gstride));
+            ah = _mm512_dpbusd_epi32(ah, wh[j], vv);
+            al = _mm512_dpbusd_epi32(al, wl[j], vv);
+          }
+          _mm512_storeu_si512((void *)(acc_hi + i), ah);
+          _mm512_storeu_si512((void *)(acc_lo + i), al);
+        }
+      }
+    }
+    {
+      const __m512 vsc = _mm512_set1_ps(wq_scale);
       for (int i = 0; i < head_dim; i += 16) {
-        __m512i vv = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(vp + i)));
-        _mm512_storeu_ps(oh + i, _mm512_fmadd_ps(_mm512_cvtepi32_ps(vv), wv,
-                                                 _mm512_loadu_ps(oh + i)));
+        __m512i a = _mm512_add_epi32(
+            _mm512_slli_epi32(_mm512_loadu_si512((const void *)(acc_hi + i)), 8),
+            _mm512_loadu_si512((const void *)(acc_lo + i)));
+        _mm512_storeu_ps(oh + i, _mm512_mul_ps(_mm512_cvtepi32_ps(a), vsc));
       }
     }
   }
@@ -466,4 +583,17 @@ void fgm_attend_q8_heads(float *out, const float *q, const int8_t *kc, const flo
 // Quantise one KV row (kv_heads*head_dim f32) to int8 with a single scale.
 void fgm_quant_kv(const float *x, int n, int8_t *q, float *scale) {
   fgm_quant_act(x, 1, n, q, scale);
+}
+
+// Store one quantised V row into the transposed cache.
+//
+// Layout is groups of four consecutive slots interleaved per dim:
+//     vt[((slot/4) * n + j) * 4 + (slot%4)] = src[j]
+// which is what lets P.V reduce over positions with vpdpbusd. Writing is a
+// stride-4 scatter of n bytes, paid once per position per layer; reading is
+// what the whole prefill does repeatedly, so this is the right side to make
+// awkward.
+void fgm_store_v_t(int8_t *vt, const int8_t *src, int n, int slot) {
+  int8_t *dst = vt + (size_t)(slot >> 2) * n * 4 + (slot & 3);
+  for (int j = 0; j < n; j++) dst[(size_t)j * 4] = src[j];
 }

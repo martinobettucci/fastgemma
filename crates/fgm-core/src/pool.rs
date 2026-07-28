@@ -160,12 +160,14 @@ fn run_attn(j: &AttnJob, i0: usize, i1: usize, scratch: &mut [f32]) {
             };
             let kc = std::slice::from_raw_parts(rr.kc, rr.k_len * kvd);
             let ks = std::slice::from_raw_parts(rr.ks, rr.k_len);
-            let vc = std::slice::from_raw_parts(rr.vc, rr.k_len * kvd);
+            // V is transposed with 4-way interleave, so its length is rounded
+            // up to whole groups of four slots.
+            let vc = std::slice::from_raw_parts(rr.vc, rr.k_len.div_ceil(4) * 4 * kvd);
             let vs = std::slice::from_raw_parts(rr.vs, rr.k_len);
             let out = std::slice::from_raw_parts_mut(j.out.add((r * nh + h) * hd), hd);
             let q = std::slice::from_raw_parts(j.q.add((r * nh + h) * hd), hd);
             k::attend_q8_heads(out, q, kc, ks, vc, vs, nh, j.kvh, hd, st, en,
-                               scratch, 0, 1, rr.ring);
+                               scratch, 0, 1, rr.ring, rr.k_len);
         }
     }
 }

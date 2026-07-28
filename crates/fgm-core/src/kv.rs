@@ -17,6 +17,16 @@ pub struct LayerKv {
     pub kv_heads: usize,
     /// `[capacity, kv_heads * head_dim]` int8
     pub k: Vec<i8>,
+    /// V, TRANSPOSED with 4-way interleave:
+    /// `v[((slot/4) * row_len + j) * 4 + (slot%4)]`.
+    ///
+    /// P.V is `out[j] = sum_t w_t v_t[j]`, a scaled accumulate, which cannot use
+    /// an integer dot-product instruction while V is stored [position][dim].
+    /// In this layout the four bytes vpdpbusd multiplies and adds inside each
+    /// 32-bit lane are four consecutive positions of one dim, so the reduction
+    /// over positions falls out of the instruction. Writing costs a stride-4
+    /// scatter once per position per layer; reading is what prefill does
+    /// O(context) times.
     pub v: Vec<i8>,
     /// per-position dequant scales
     pub ks: Vec<f32>,
@@ -32,6 +42,11 @@ impl LayerKv {
     #[inline]
     pub fn row_len(&self) -> usize {
         self.kv_heads * self.head_dim
+    }
+    /// int8 elements the transposed V array needs for `capacity` slots.
+    #[inline]
+    pub fn vt_len(&self) -> usize {
+        self.capacity.div_ceil(4) * 4 * self.row_len()
     }
 }
 
@@ -80,7 +95,7 @@ impl KvCache {
                 head_dim: hd,
                 kv_heads: kvh,
                 k: vec![0; cap * kvh * hd],
-                v: vec![0; cap * kvh * hd],
+                v: vec![0; cap.div_ceil(4) * 4 * kvh * hd],
                 ks: vec![0.0; cap],
                 vs: vec![0.0; cap],
                 ring: !needs_full,
@@ -117,7 +132,9 @@ impl KvCache {
             let slots = if s.ring && src.len >= s.capacity { s.capacity } else { src.len };
             let row = s.row_len();
             dst.k[..slots * row].copy_from_slice(&s.k[..slots * row]);
-            dst.v[..slots * row].copy_from_slice(&s.v[..slots * row]);
+            // V is grouped four slots at a time, so copy whole groups.
+            let vg = slots.div_ceil(4) * 4 * row;
+            dst.v[..vg].copy_from_slice(&s.v[..vg]);
             dst.ks[..slots].copy_from_slice(&s.ks[..slots]);
             dst.vs[..slots].copy_from_slice(&s.vs[..slots]);
         }

@@ -54,8 +54,9 @@ extern "C" {
         out: *mut f32, q: *const f32, kc: *const i8, ks: *const f32,
         vc: *const i8, vs: *const f32, n_heads: i32, kv_heads: i32,
         head_dim: i32, start: i32, end: i32, scratch: *mut f32,
-        h0: i32, h1: i32, ring: i32,
+        h0: i32, h1: i32, ring: i32, cap: i32,
     );
+    fn fgm_store_v_t(vt: *mut i8, src: *const i8, n: i32, slot: i32);
 }
 
 static AMX: Once = Once::new();
@@ -226,18 +227,36 @@ pub fn attend_q8(
 pub fn attend_q8_heads(
     out: &mut [f32], q: &[f32], kc: &[i8], ks: &[f32], vc: &[i8], vs: &[f32],
     n_heads: usize, kv_heads: usize, head_dim: usize, start: usize, end: usize,
-    scratch: &mut [f32], h0: usize, h1: usize, ring: usize,
+    scratch: &mut [f32], h0: usize, h1: usize, ring: usize, cap: usize,
 ) {
-    debug_assert!(scratch.len() >= end - start);
+    // Scratch holds the scores, then u8 weights indexed by slot, then int32
+    // accumulators -- all sized off the capacity, since a slot is always < cap
+    // and a score range is never longer than the cache holding it.
+    debug_assert!(scratch.len() >= attend_scratch(cap, head_dim));
     debug_assert!(ring == 0 || kc.len() >= ring * kv_heads * head_dim);
+    debug_assert!(vc.len() >= cap.div_ceil(4) * 4 * kv_heads * head_dim);
     unsafe {
         fgm_attend_q8_heads(
             out.as_mut_ptr(), q.as_ptr(), kc.as_ptr(), ks.as_ptr(),
             vc.as_ptr(), vs.as_ptr(), n_heads as i32, kv_heads as i32,
             head_dim as i32, start as i32, end as i32, scratch.as_mut_ptr(),
-            h0 as i32, h1 as i32, ring as i32,
+            h0 as i32, h1 as i32, ring as i32, cap as i32,
         )
     }
+}
+
+/// Floats of scratch `attend_q8_heads` needs for a cache of `cap` positions.
+pub fn attend_scratch(cap: usize, head_dim: usize) -> usize {
+    // scores, two u8 weight planes, two int32 accumulator sets
+    cap + cap.div_ceil(2) + 2 * head_dim + 64
+}
+
+/// Write one quantised V row into the transposed cache at `slot`.
+#[inline]
+pub fn store_v_t(vt: &mut [i8], src: &[i8], n: usize, slot: usize) {
+    debug_assert!(vt.len() >= (slot / 4 + 1) * n * 4);
+    debug_assert!(src.len() >= n);
+    unsafe { fgm_store_v_t(vt.as_mut_ptr(), src.as_ptr(), n as i32, slot as i32) }
 }
 
 /// Does this platform preserve AMX tile state across a context switch?

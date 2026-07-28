@@ -26,7 +26,8 @@
 void fgm_attend_q8_heads(float *out, const float *q, const int8_t *kc, const float *ks,
                          const int8_t *vc, const float *vs, int n_heads, int kv_heads,
                          int head_dim, int start, int end, float *scratch,
-                         int h0, int h1, int ring);
+                         int h0, int h1, int ring, int cap);
+void fgm_store_v_t(int8_t *vt, const int8_t *src, int n, int slot);
 
 static uint64_t rs = 12345;
 static float rnd(void) {
@@ -40,9 +41,11 @@ static float rnd(void) {
 #define N 1000
 
 static float qf[NH * HD], kf[N * HD], vf[N * HD];
-static int8_t kc[N * HD], vc[N * HD];
+static int8_t kc[N * HD], vrow[HD];
+/* V lives transposed with 4-way interleave, rounded to whole groups */
+static int8_t vc[((N + 3) / 4) * 4 * HD];
 static float ks[N], vs[N];
-static float out[NH * HD], scratch[N + 64];
+static float out[NH * HD], scratch[2 * N + 4 * HD + 256];
 static double exact[NH * HD], cached[NH * HD], got[NH * HD];
 
 // Exact attention in double precision. `quantk`/`quantv` select which operands
@@ -63,7 +66,9 @@ static void reference(double *o, int quantk, int quantv, int start, int end) {
     for (int i = 0; i < HD; i++) {
       double acc = 0;
       for (int t = start; t < end; t++) {
-        double vv = quantv ? (double)vc[(size_t)t * HD + i] * vs[t] : vf[(size_t)t * HD + i];
+        double vv = quantv
+            ? (double)vc[((size_t)(t / 4) * HD + i) * 4 + (t % 4)] * vs[t]
+            : vf[(size_t)t * HD + i];
         acc += sc[t - start] / sum * vv;
       }
       o[h * HD + i] = acc;
@@ -98,12 +103,13 @@ int main(void) {
       ks[t] = ka / 127.0f; vs[t] = va / 127.0f;
       for (int i = 0; i < HD; i++) {
         kc[(size_t)t * HD + i] = (int8_t)lrintf(kf[(size_t)t * HD + i] / ks[t]);
-        vc[(size_t)t * HD + i] = (int8_t)lrintf(vf[(size_t)t * HD + i] / vs[t]);
+        vrow[i] = (int8_t)lrintf(vf[(size_t)t * HD + i] / vs[t]);
       }
+      fgm_store_v_t(vc, vrow, HD, t);
     }
     reference(exact, 0, 0, 0, N);
     reference(cached, 1, 1, 0, N);
-    fgm_attend_q8_heads(out, qf, kc, ks, vc, vs, NH, KVH, HD, 0, N, scratch, 0, NH, 0);
+    fgm_attend_q8_heads(out, qf, kc, ks, vc, vs, NH, KVH, HD, 0, N, scratch, 0, NH, 0, N);
     for (int i = 0; i < NH * HD; i++) got[i] = out[i];
     double e_cache = rel(cached, exact), e_kernel = rel(got, exact);
     double ratio = e_kernel / (e_cache + 1e-30);

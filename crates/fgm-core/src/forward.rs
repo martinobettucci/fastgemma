@@ -176,6 +176,8 @@ struct Buf {
     ple_raw: Vec<f32>,
     ple_proj: Vec<f32>,
     tmp: Vec<f32>,
+    /// one quantised KV row, staged before the transposed scatter into V
+    vrow: Vec<i8>,
     logits: Vec<f32>,
 }
 
@@ -317,12 +319,10 @@ impl<'m> Runner<'m> {
                 ple_raw: vec![0.0; nl * pd],
                 ple_proj: vec![0.0; nl * pd],
                 tmp: vec![0.0; hs.max(kmax)],
+                vrow: vec![0; kvh * hdmax],
                 logits: vec![0.0; max_logit_rows * cfg.vocab_size],
             },
-            pool: Pool::new(
-                threads,
-                max_ctx + 64,
-            ),
+            pool: Pool::new(threads, k::attend_scratch(max_ctx + 64, hdmax)),
             layers,
             model,
             cfg,
@@ -505,8 +505,12 @@ impl<'m> Runner<'m> {
                     k::quant_act(&b.kbuf[r * rl..(r + 1) * rl], 1, rl,
                                  &mut lk.k[slot * rl..(slot + 1) * rl], &mut s1);
                     lk.ks[slot] = s1[0];
+                    // V goes into the cache transposed, so P.V can reduce over
+                    // positions with an integer dot product. Quantise into a
+                    // scratch row first, then scatter.
                     k::quant_act(&b.vbuf[r * rl..(r + 1) * rl], 1, rl,
-                                 &mut lk.v[slot * rl..(slot + 1) * rl], &mut s1);
+                                 &mut b.vrow[..rl], &mut s1);
+                    k::store_v_t(&mut lk.v, &b.vrow[..rl], rl, slot);
                     lk.vs[slot] = s1[0];
                 }
                 tock!(_t, prof, 4);
