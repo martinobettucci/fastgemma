@@ -83,7 +83,6 @@ unsafe impl Sync for Inner {}
 
 pub struct Pool {
     nt: usize,
-    scratch_len: usize,
     inner: Arc<Inner>,
     handles: Vec<JoinHandle<()>>,
     scratch: std::cell::UnsafeCell<Vec<f32>>,
@@ -190,7 +189,6 @@ impl Pool {
         k::amx_init();
         Pool {
             nt,
-            scratch_len,
             inner,
             handles,
             scratch: std::cell::UnsafeCell::new(vec![0.0f32; scratch_len]),
@@ -206,7 +204,11 @@ impl Pool {
             run_gemm(&job, 0, job.n / 16);
             return;
         }
-        self.dispatch(Job::Gemm(job), |tid, nt| split_gemm(job.n / 16, nt, tid), &job);
+        unsafe { *self.inner.job.get() = Some(Job::Gemm(job)) };
+        self.inner.start.wait();
+        let (a, b) = split_gemm(job.n / 16, self.nt, 0);
+        run_gemm(&job, a, b);
+        self.inner.done.wait();
     }
 
     pub fn attn(&self, job: AttnJob) {
@@ -222,13 +224,6 @@ impl Pool {
         self.inner.done.wait();
     }
 
-    fn dispatch<F: Fn(usize, usize) -> (usize, usize)>(&self, job: Job, split: F, g: &GemmJob) {
-        unsafe { *self.inner.job.get() = Some(job) };
-        self.inner.start.wait();
-        let (a, b) = split(0, self.nt);
-        run_gemm(g, a, b);
-        self.inner.done.wait();
-    }
 }
 
 impl Drop for Pool {

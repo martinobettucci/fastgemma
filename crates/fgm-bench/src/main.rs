@@ -25,27 +25,6 @@ fn synth_tokens(n: usize, seed: u64) -> Vec<u32> {
         .collect()
 }
 
-/// Minimal structural JSON check, so the bench does not need a JSON dependency.
-fn serde_json_check(s: &str) -> bool {
-    let mut depth = 0i32;
-    let mut in_str = false;
-    let mut prev_esc = false;
-    for ch in s.chars() {
-        if in_str {
-            if prev_esc { prev_esc = false; continue; }
-            match ch { '\\' => prev_esc = true, '"' => in_str = false, _ => {} }
-            continue;
-        }
-        match ch {
-            '"' => in_str = true,
-            '{' | '[' => depth += 1,
-            '}' | ']' => { depth -= 1; if depth < 0 { return false; } }
-            _ => {}
-        }
-    }
-    depth == 0 && !in_str
-}
-
 fn argmax(v: &[f32]) -> usize {
     let mut best = (0usize, f32::NEG_INFINITY);
     for (i, &x) in v.iter().enumerate() {
@@ -187,7 +166,7 @@ fn main() {
             let t_dec = Instant::now();
             let mut steps = 0usize;
             for step in 0..pout {
-                let pos: Vec<usize> = (0..conc).map(|s| pin + step).collect();
+                let pos: Vec<usize> = vec![pin + step; conc];
                 let lg = r.forward_multi(&toks, &seq, &pos, &mut caches, &rows);
                 for s in 0..conc {
                     toks[s] = argmax(&lg[s * cfg.vocab_size..(s + 1) * cfg.vocab_size]) as u32;

@@ -111,7 +111,6 @@ struct Buf {
     ple_raw: Vec<f32>,
     ple_proj: Vec<f32>,
     tmp: Vec<f32>,
-    sc: Vec<f32>,
     logits: Vec<f32>,
 }
 
@@ -242,7 +241,6 @@ impl<'m> Runner<'m> {
                 ple_raw: vec![0.0; nl * pd],
                 ple_proj: vec![0.0; nl * pd],
                 tmp: vec![0.0; hs.max(kmax)],
-                sc: vec![0.0; max_ctx + 64],
                 logits: vec![0.0; max_logit_rows * cfg.vocab_size],
             },
             pool: Pool::new(threads, max_ctx + 64),
