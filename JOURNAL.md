@@ -998,23 +998,30 @@ second V reader through that is real complexity for a path that never wins.
 (+1.56 GB — an int8 twin is *twice* the int4 bytes, not the same; I had this
 at +778 MB and was wrong). `FGM_WEIGHTS=int4|int8|auto:M`, default `auto:16`.
 
+Median of 5 runs per cell, full range in brackets, concurrency 1, idle box.
+Ranges are **disjoint in every cell**, which is the bar a claim has to clear
+here: one sample per arm cannot resolve anything under ~10% (§16).
+
 Prefill, tok/s:
 
-| shape | int4 | int8 | int8 gain |
+| prompt | int4 | int8 | int8 gain |
 |---|---|---|---|
-| c=1, 1024 | 226.2 | **255.2** | +12.8% |
-| c=1, 8192 | 141.5 | **160.7** | +13.6% |
-| c=8, 1024 | 224.9 | **257.1** | +14.3% |
-| c=8, 8192 | 147.7 | **162.4** | +10.0% |
+| 1024 | 216.7 [210–234] | **280.3 [240–284]** | +29.4% |
+| 8192 | 150.7 [144–151] | **168.5 [160–170]** | +11.8% |
 
 Decode, tok/s:
 
-| shape | int4 | int8 | int4 gain |
+| prompt | int4 | int8 | int4 gain |
 |---|---|---|---|
-| c=1, 1024 | **13.5** | 13.4 | +0.7% |
-| c=1, 8192 | **13.3** | 12.5 | +6.4% |
-| c=8, 1024 | **67.8** | 67.6 | +0.3% |
-| c=8, 8192 | **49.4** | 46.7 | +5.8% |
+| 1024 | **14.2 [14.0–15.0]** | 13.2 [12.8–13.9] | +7.6% |
+| 8192 | **13.8 [13.1–14.5]** | 12.2 [11.1–12.8] | +13.1% |
+
+Both effects are *larger* than the single-shot numbers first reported (+12.8%
+/ +13.6% prefill, +0.7% / +6.4% decode). Withdrawing them in §16 was right —
+they were 0.2–2.9σ from one sample each — and re-measuring restored both with
+evidence that actually supports them. Note the direction of the correction: the
+noisy measurements **understated** the real effect in three of four cells. Noise
+does not only inflate results.
 
 Exactly the split the design predicted, for the reason it predicted: a prefill
 GEMM shares one weight read across hundreds of rows and is compute-bound, where
@@ -1094,12 +1101,15 @@ winning, but the sentence claimed more than the data supports, and at 128 in
 particular attention is only 5.1% of prefill so there was nothing there to
 measure in the first place.
 
-**Withdrawn: the decode half of the dual-weight claim as originally stated.**
-+0.7% to +6.4% from single samples is 0.2σ to 1.5σ. First principles say int4
-should win decode — it is DRAM-bound and int4 halves the bytes — but "first
+**Withdrawn, then restored on better evidence: the decode half of the dual-weight
+claim.** +0.7% to +6.4% from single samples is 0.2σ to 1.5σ. First principles say
+int4 should win decode — it is DRAM-bound and int4 halves the bytes — but "first
 principles say so" is what the 1924 GB estimate in §12 and the 11%-attention
-estimate in §14 also had going for them. Re-measured as a median of repeats it
-holds and is *larger* than first reported (§15 table revised).
+estimate in §14 also had going for them. Re-measured as a median of 5 with
+disjoint ranges it holds at **+7.6% and +13.1%** — larger than first reported.
+The lesson is not "the claim was wrong" but "the method could not tell", and a
+method that cannot tell understates as often as it overstates: three of the four
+cells came back bigger, not smaller.
 
 ### The fix
 
