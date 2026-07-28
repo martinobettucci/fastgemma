@@ -350,8 +350,20 @@ void fgm_attend_q8_heads(float *out, const float *q, const int8_t *kc, const flo
       sc[t - start] = s;
       if (s > mx) mx = s;
     }
-    float sum = 0.0f;
-    for (int t = 0; t < end - start; t++) { sc[t] = expf(sc[t] - mx); sum += sc[t]; }
+    // Vectorised softmax. This loop ran scalar libm expf while the blocked
+    // kernel two functions down already used exp512_ps -- and it is the hot one:
+    // over an 8192-token prefill the full-attention layers alone evaluate
+    // sum_r r * n_heads * n_full = 1.9e9 exponentials.
+    const int n = end - start;
+    __m512 vmx = _mm512_set1_ps(mx), vsum = _mm512_setzero_ps();
+    int t = 0;
+    for (; t + 16 <= n; t += 16) {
+      __m512 e = exp512_ps(_mm512_sub_ps(_mm512_loadu_ps(sc + t), vmx));
+      _mm512_storeu_ps(sc + t, e);
+      vsum = _mm512_add_ps(vsum, e);
+    }
+    float sum = _mm512_reduce_add_ps(vsum);
+    for (; t < n; t++) { sc[t] = expf(sc[t] - mx); sum += sc[t]; }
     float inv = 1.0f / sum;
     float *oh = out + (size_t)h * head_dim;
     for (int i = 0; i < head_dim; i += 16) _mm512_storeu_ps(oh + i, _mm512_setzero_ps());
