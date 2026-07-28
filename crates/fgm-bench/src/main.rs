@@ -401,6 +401,48 @@ fn main() {
                      caches[0].bytes() as f64 / 1e6, ctx);
         }
 
+        // Generate from a prompt of token ids. Emits the generated ids so an
+        // external harness can decode and grade behaviour -- which is the real
+        // acceptance test. Matching a reference engine's logits cannot be: we
+        // deliberately trade numerical precision (int4 weights, int8
+        // activations, Hadamard rotation, online softmax) for speed, so a
+        // different number that yields the same correct action is a pass.
+        "generate" => {
+            let toks: Vec<u32> = args[3].split(',').map(|x| x.parse().unwrap()).collect();
+            let ngen: usize = args.get(4).and_then(|v| v.parse().ok()).unwrap_or(64);
+            let eos: Vec<u32> = std::env::var("FGM_EOS").ok()
+                .map(|v| v.split(',').filter_map(|x| x.parse().ok()).collect())
+                .unwrap_or_else(|| vec![1, 106]);
+            let chunk = 256usize;
+            let ctx = toks.len() + ngen + 8;
+            let mut caches = vec![KvCache::new(&cfg, ctx, chunk)];
+            let mut r = Runner::new(&model, chunk.max(1), ctx, threads());
+
+            let t0 = Instant::now();
+            let mut off = 0;
+            while off < toks.len() {
+                let n = chunk.min(toks.len() - off);
+                r.forward(&toks[off..off + n], off, &mut caches[0]);
+                off += n;
+            }
+            let ttft = t0.elapsed().as_secs_f64();
+
+            let mut out = Vec::with_capacity(ngen);
+            let mut tok = argmax(r.forward(&toks[toks.len() - 1..], toks.len() - 1, &mut caches[0])) as u32;
+            let mut pos = toks.len();
+            for _ in 0..ngen {
+                if eos.contains(&tok) { break; }
+                out.push(tok);
+                tok = argmax(r.forward(&[tok], pos, &mut caches[0])) as u32;
+                pos += 1;
+            }
+            let el = t0.elapsed().as_secs_f64();
+            eprintln!("prompt {} tok, TTFT {:.2}s, generated {} tok in {:.2}s ({:.1} tok/s)",
+                      toks.len(), ttft, out.len(), el - ttft,
+                      out.len() as f64 / (el - ttft).max(1e-9));
+            println!("{}", out.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","));
+        }
+
         m => {
             eprintln!("unknown mode {m}");
             std::process::exit(2);

@@ -419,7 +419,6 @@ void fgm_attend_blocked(float *out, const float *q, const fa_row_t *rows, int m,
   float *rmax = scratch;                       /* FA_BR * n_heads */
   float *rsum = rmax + FA_BR * 32;
   float *acc = rsum + FA_BR * 32;              /* FA_BR * n_heads * HD */
-  float *kbuf = acc + FA_BR * 32 * HD;         /* FA_BC * HD dequantised */
 
   for (int qb = r0; qb < r1; qb += FA_BR) {
     const int br = (qb + FA_BR <= r1) ? FA_BR : (r1 - qb);
@@ -437,19 +436,16 @@ void fgm_attend_blocked(float *out, const float *q, const fa_row_t *rows, int m,
     const fa_row_t *rr = &rows[qb];
     for (int kb = lo; kb < hi; kb += FA_BC) {
       const int bc = (kb + FA_BC <= hi) ? FA_BC : (hi - kb);
-      // dequantise the K block once for the whole query block
-      for (int t = 0; t < bc; t++) {
-        int slot = rr->k_len ? ((kb + t) % rr->k_len) : (kb + t);
-        const int8_t *kp = rr->kc + (size_t)slot * kvd;
-        float sc = rr->ks[slot];
-        __m512 vsc = _mm512_set1_ps(sc);
-        for (int i = 0; i < kvd; i += 16) {
-          __m512i v = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(kp + i)));
-          _mm512_storeu_ps(kbuf + (size_t)t * kvd + i,
-                           _mm512_mul_ps(_mm512_cvtepi32_ps(v), vsc));
-        }
-      }
-
+      // K stays int8 and is converted inline in the dot product.
+      //
+      // The first version of this kernel dequantised the block to f32 up front,
+      // reasoning that the conversion should happen once rather than once per
+      // (row, head). That was a mistake: f32 is a 4x expansion, so a 1 MB int8
+      // K block became a 4 MB f32 block that spilled L2 -- and the kernel came
+      // out 9-15% SLOWER than the naive path it replaced. The win from blocking
+      // is L1 residency of the block, which only exists if the block stays
+      // small. Redundant int8->f32 conversion is compute, and compute is not
+      // what is scarce here.
       for (int r = 0; r < br; r++) {
         const int pos = rows[qb + r].pos;
         const int lo_r = (window > 0 && pos >= window) ? pos - (window - 1) : 0;
@@ -462,11 +458,14 @@ void fgm_attend_blocked(float *out, const float *q, const fa_row_t *rows, int m,
           for (int t = 0; t < bc; t++) {
             const int p = kb + t;
             if (p > pos || p < lo_r) continue;           /* causal + window */
-            const float *kp = kbuf + (size_t)t * kvd + kvh * HD;
+            const int kslot = rr->k_len ? (p % rr->k_len) : p;
+            const int8_t *kp = rr->kc + (size_t)kslot * kvd + kvh * HD;
             __m512 dot = _mm512_setzero_ps();
-            for (int i = 0; i < HD; i += 16)
-              dot = _mm512_fmadd_ps(_mm512_loadu_ps(qh + i), _mm512_loadu_ps(kp + i), dot);
-            float sc = _mm512_reduce_add_ps(dot);
+            for (int i = 0; i < HD; i += 16) {
+              __m512i kv = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(kp + i)));
+              dot = _mm512_fmadd_ps(_mm512_loadu_ps(qh + i), _mm512_cvtepi32_ps(kv), dot);
+            }
+            float sc = _mm512_reduce_add_ps(dot) * rr->ks[kslot];
 
             if (sc > mx) {                                /* rescale to new max */
               const float f = expf(mx - sc);
@@ -509,7 +508,8 @@ void fgm_attend_blocked(float *out, const float *q, const fa_row_t *rows, int m,
 
 // Scratch floats needed by fgm_attend_blocked.
 int fgm_attend_blocked_scratch(int n_heads, int head_dim, int kv_heads) {
-  return FA_BR * 32 * 2 + FA_BR * 32 * head_dim + FA_BC * kv_heads * head_dim + 64;
+  (void)kv_heads;
+  return FA_BR * 32 * 2 + FA_BR * 32 * head_dim + 64;
 }
 
 // Quantise one KV row (kv_heads*head_dim f32) to int8 with a single scale.
