@@ -326,6 +326,17 @@ Next steps there, in order of expected payoff:
    (`q_norm` already bounds Q's range), which is the same 12.7× lever.
 3. Skip the sliding layers' out-of-window positions in the *scale* array too.
 
+**Trap 10 — benchmarking a long run while doing anything else.** The first
+attempt at the full 8x8k serve run died silently ~15 minutes in, with an empty
+log after the KV line. I had been running cargo builds, a 3.35 GB download and
+another bench alongside it. Worse, my liveness check was
+`pgrep -f "fgm-bench serve"`, which matched Claude Code's own multi-kilobyte
+command line and reported the run as healthy long after the process was gone.
+Re-running with nothing else on the box and an explicit `pgrep -x fgm-bench`
+plus a memory trace. Two lessons: match process names exactly when the
+environment has enormous command lines, and treat "the long benchmark is still
+running" as a claim needing evidence (load average was 0.00 the whole time).
+
 ---
 
 ## 7. Constrained tool calling
