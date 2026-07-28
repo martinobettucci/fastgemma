@@ -4,7 +4,7 @@
 //!   dump  <model> <tokens-csv> [out.bin]   one forward, write logits (validation)
 //!   sweep <model>                          prefill/decode throughput vs shape
 //!
-//! `FGM_THREADS` sets the GEMM pool size (default 4).
+//! `FGM_THREADS` sets the pool size (default: all available cores).
 
 use fgm_core::forward::{NPHASE, PHASE_NAMES};
 use fgm_core::{KvCache, Model, Runner};
@@ -109,8 +109,14 @@ fn verify_clean() {
     }
 }
 
+/// Pool size. Defaults to every available core rather than a hardcoded 4 --
+/// the old default silently used 4 threads on a 16-core box, which reads as
+/// "the engine does not scale" when it is really "the engine was not asked to".
 fn threads() -> usize {
-    std::env::var("FGM_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
+    std::env::var("FGM_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|v| v.get()).unwrap_or(4))
 }
 
 /// Deterministic pseudo-random token ids, avoiding special ids.

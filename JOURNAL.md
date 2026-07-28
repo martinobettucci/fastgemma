@@ -1586,3 +1586,55 @@ flawed part, and at 8k with 4 MB of K per full-attention layer it is no longer
 L2-resident. **Head-batched attention is the correct next optimisation**, and it
 is the one this analysis points to rather than anything involving tile
 registers.
+
+
+---
+
+## 25. Does this scale to 8, 16 or more cores?
+
+Answered from the code rather than from intuition, because the answer differs
+by phase and one of the four limits is a real refactor.
+
+**0. It was not even asking for the cores.** `FGM_THREADS` defaulted to a
+hardcoded **4**. On a 16-core box the engine would have used four of them and
+looked like it did not scale, when it had not been asked to. Now defaults to
+`available_parallelism()`. Worth recording as its own item: the most likely
+cause of "it does not scale" is not always in the parallel decomposition.
+
+**1. Prefill scales well.** GEMM splits on output columns in groups of 4
+n-blocks (64 columns each): FFN N=6144 → 96 groups, double-wide N=12288 → 192,
+lm_head N=262144 → 4096. At 16 threads that is 6–12 groups per thread; at 64 it
+is 1.5–3, thin but functional. Attention splits on `m × n_heads` = 256 × 8 =
+**2048 units** during prefill, ample for 64+ threads.
+
+**2. Decode does not scale past 8 threads, structurally.** Attention splits on
+`m × n_heads`. At concurrency 1 that is `1 × 8 = 8 work units total` — threads
+9 and up idle. At concurrency 8 it is 64. Decode GEMM still splits on N, but
+decode is DRAM-bound, so extra threads mostly contend for the same bandwidth
+rather than adding throughput. Expect a decode plateau near 8 threads whatever
+the core count.
+
+**3. Barrier cost grows with thread count.** `std::sync::Barrier` is
+mutex+condvar. A forward pass issues ~245 pool jobs (35 layers × ~7), each with
+a start and a done barrier — roughly **490 barrier waits per token**. Negligible
+at 4 threads; at 32+ the condvar wakeups become a measurable fraction of a 13 ms
+decode step. A spin-then-park barrier or work-stealing would be the fix.
+
+**4. Multi-socket is the genuine refactor.** This box is one NUMA node. On two
+sockets, the mmap'd weights land on whichever node first touches them and half
+the threads would issue remote reads across the interconnect. That needs
+first-touch interleaving or per-node weight replication — real work, not a flag.
+
+### Summary
+
+| target | expectation |
+|---|---|
+| 8–16 cores, 1 socket | prefill scales near-linearly; decode plateaus ~8 threads |
+| 32–64 cores, 1 socket | prefill still gains; barriers want replacing |
+| 2+ sockets | needs NUMA-aware weight placement first |
+
+Combined with §24: more cores also raise aggregate memory bandwidth until the
+channels saturate, which is what actually accelerates the bandwidth-bound 46%
+of prefill that attention occupies at 8192. So a bigger single-socket machine
+helps twice — more compute for the GEMMs, more bandwidth for attention — with
+no code change beyond the thread default now fixed.
