@@ -215,8 +215,14 @@ fn main() {
     let cfg = model.cfg.clone();
     eprintln!("model {} ({:.2} GB) mapped in {:?}", path,
               model.total_bytes() as f64 / 1e9, t0.elapsed());
+    // Probe an FFN weight, not an attention one. q/k/v/o are already int8 at
+    // conversion (--attn-bits 8), so `--weights=both` never makes them a twin
+    // and `l0.q_proj.i8` is absent even on a dual-format file. This banner
+    // reported "int4 only" for the dual model through every A/B in this
+    // session; the measurements were unaffected because the twins that matter
+    // are the FFN ones, but the label was wrong.
     eprintln!("  weights: {:?}{}", fgm_core::forward::WeightSel::from_env(),
-              if model.has("l0.q_proj.i8") { " (file carries int8 twins)" }
+              if model.has("l0.gate_proj.i8") { " (file carries int8 FFN twins)" }
               else { " (int4 only -- convert with --weights=both for twins)" });
     eprintln!("  H={} L={} heads={} kv={} hd={}/{} inter={} vocab={} threads={}",
               cfg.hidden_size, cfg.num_hidden_layers, cfg.num_attention_heads,

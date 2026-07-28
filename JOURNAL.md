@@ -1349,3 +1349,44 @@ in time, so more repetitions of a cross-run comparison converge on the wrong
 answer rather than on the right one with wider error bars. The only fix is to
 put both arms in one binary and alternate them, so the drift is common-mode.
 That is now how `FGM_SCALAR_WFILL` exists.
+
+
+---
+
+## 21. The target profile, end to end
+
+The brief: 8 concurrent requests, ~8k prompt in, ~2k out, 12 tools x 4 params.
+Run with everything current engaged — dual-format weights on `auto:16`, prefix
+sharing over a 2048-token shared declaration block, VNNI int8 attention.
+
+| | measured |
+|---|---|
+| prefill | 65536 tok in 342.07 s → **191.6 tok/s aggregate** |
+| prefix sharing | 14336 prefill tokens avoided, 422 ms fork |
+| decode | **46.8 tok/s aggregate** (170.9 ms/step, 5.9 tok/s/seq) |
+| TTFT | first **70.1 s**, last 342.1 s |
+| KV | **332 MB total, 41.4 MB/seq** at 10248 context |
+| full request set | ~692 s extrapolated → **118 tok/s overall** |
+
+81920 tokens of work (8 × 10240) in ~692 s. Decode was capped at 60 s and
+extrapolated from 352 measured steps, which is stated rather than hidden: the
+decode rate is measured, the total is arithmetic.
+
+**This is a pessimistic reading.** The warm-up reported *8 of 12* tile-state
+trials corrupted, the worst seen in this project (earlier runs: 5/12, 6/12,
+7/12). Every corrupted tile re-runs a whole GEMM block, so this run carried
+more guard overhead than any baseline it might be compared against.
+
+### What it says about the shape of the problem
+
+TTFT spread is 70 s to 342 s — the eighth request waits for all seven ahead of
+it, because prefill is processed sequentially per sequence. That is the single
+most user-visible number here and it is not a throughput problem: aggregate
+prefill is 191.6 tok/s either way. Interleaving prefill chunks across sequences
+would flatten TTFT without changing throughput at all, and is the obvious next
+serving-layer change — it was never on the optimisation list because the list
+was about tok/s, and TTFT is not tok/s.
+
+Decode at 46.8 tok/s aggregate against 67.3 measured at 512 context earlier is
+the cost of an 8-10k KV set: attention grows with context while the weight read
+does not, so the batching win erodes as the context lengthens.
