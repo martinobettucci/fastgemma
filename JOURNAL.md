@@ -1299,3 +1299,53 @@ So the levers are, in order:
 against.** "AMX is 12.7× VNNI" is true and was nearly decisive. It is also
 irrelevant to a kernel that uses 5% of VNNI, and nothing about the ratio itself
 says so. The number that mattered was one nobody quotes: bytes per MAC.
+
+
+---
+
+## 20. The weight-fill vectorisation: no end-to-end effect, and why
+
+The attention ceiling probe (§19) found the P·V u8 weight fill running scalar,
+costing about as much as the Q·Kᵀ it feeds. Vectorising it gave 6–40% in the
+kernel microbenchmark. End to end it gives **nothing**.
+
+Alternating arms inside one measurement window, 8192-token prefill, seconds:
+
+| pass | vector ttft | scalar ttft | vector gen | scalar gen |
+|---|---|---|---|---|
+| 1 | 55.59 | 55.63 | 4.92 | 5.69 |
+| 2 | 53.58 | 53.35 | 4.70 | 4.64 |
+| 3 | 53.65 | 54.03 | 4.79 | 4.78 |
+| median | **53.65** | **54.03** | **4.79** | **4.78** |
+
+0.7% on prefill and 0.2% on decode — noise, in both directions.
+
+**Why the kernel gain does not reach the model: 28 of 35 layers are sliding
+with ring buffers, and the ring path is deliberately still scalar** (slot
+indices jump at the wrap, so a vector store would need a scatter). Only the 7
+full-attention layers take the vectorised branch — and the sliding layers'
+fill was cheap anyway, since their range is capped at the 512-token window.
+The microbenchmark measured 16 rows against a full contiguous context, which
+is the full-attention shape exclusively. It answered a question the model does
+not ask.
+
+Kept rather than reverted: it is measurably faster in the kernel, measurably
+neutral in the model, and carries no accuracy cost (error harness unchanged at
+1.21–1.74×). But it is not a win, and recording it as one would be false.
+
+### And the "regression" was the platform
+
+The run that triggered all this read 160.1 tok/s prefill and 9.6 tok/s decode
+against a 216.7 / 14.2 baseline. Median ttft in the controlled test is 53.65 s
+at 8192 = **152.7 tok/s**, against the 150.7 baseline. There was never a
+regression. The AMX tile-state corruption rate had drifted (5/12 → 7/12 trials
+at warm-up; 2884 and 10182 guard retries logged in one run), and every
+corrupted tile re-runs a whole GEMM block.
+
+**Trap 18 — when the noise source is a platform defect, cross-run A/B is not
+weak evidence, it is no evidence.** §16 established that one sample per arm
+cannot resolve under ~10% here. This is worse: the confound is *not* symmetric
+in time, so more repetitions of a cross-run comparison converge on the wrong
+answer rather than on the right one with wider error bars. The only fix is to
+put both arms in one binary and alternate them, so the drift is common-mode.
+That is now how `FGM_SCALAR_WFILL` exists.
