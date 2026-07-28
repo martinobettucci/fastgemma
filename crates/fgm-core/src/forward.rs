@@ -301,6 +301,30 @@ impl<'m> Runner<'m> {
         let dumping = std::env::var_os("FGM_DUMP").is_some();
         let profiling = self.profiling;
         let mut prof = [0.0f64; NPHASE];
+        // Diagnostic for the non-determinism defect: if zeroing scratch makes
+        // two identical calls agree, some buffer is read before it is written.
+        if let Ok(z) = std::env::var("FGM_ZERO") {
+            let b = &mut self.b;
+            for (name, buf) in [
+                ("h", &mut b.h), ("xn", &mut b.xn), ("q", &mut b.q),
+                ("kbuf", &mut b.kbuf), ("vbuf", &mut b.vbuf), ("ao", &mut b.ao),
+                ("proj", &mut b.proj), ("g", &mut b.g), ("u", &mut b.u),
+                ("act", &mut b.act), ("p", &mut b.p), ("pout", &mut b.pout),
+                ("ple", &mut b.ple), ("ple_raw", &mut b.ple_raw),
+                ("ple_proj", &mut b.ple_proj), ("tmp", &mut b.tmp),
+                ("logits", &mut b.logits),
+            ] {
+                if z == "all" || z == name {
+                    buf.fill(0.0);
+                }
+            }
+            if z == "all" || z == "gm" {
+                self.gm.rot.fill(0.0);
+                self.gm.qs.fill(0.0);
+                self.gm.qa.fill(0);
+                self.gm.pa.fill(0);
+            }
+        }
         if dumping {
             self.dump.clear();
         }

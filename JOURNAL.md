@@ -362,32 +362,49 @@ overwrite history the earlier rows still need. A ring must hold
 `sliding_window + max_batch`. Fixed, with a `debug_assert` that states the
 requirement. This one produces silently wrong logits, not a crash — much worse.
 
-**Open defect — the engine is not deterministic.**
-The regression test that caught B also caught this, and it is not fixed:
+**Partly-fixed defect — intermittent non-determinism.**
+The regression test that caught B also caught this. Two identical `forward`
+calls on freshly zeroed caches sometimes disagree.
 
-| threads | same inputs, two runs, max abs logit diff |
-|---|---|
-| 1 | up to 2.85 |
-| 2 | 1.35 |
-| 4 | 7.35 – 7.73 |
+*Cause 1, found and fixed: undefined behaviour in the `forward` wrapper.* It
+took the scratch `seq`/`pos` vectors out of `self` with `mem::take`, called
+`forward_multi`, kept a raw pointer into the returned slice, mutated `self` to
+put the vectors back, then rebuilt the slice from that pointer. Holding a
+pointer into `self.b.logits` across a mutation of `self` is UB, and the
+optimiser is entitled to anything. Removing it (two small local `Vec`s instead —
+free next to a forward pass) made several sizes go bit-deterministic. `forward.rs`
+now contains no `unsafe` at all.
 
-Within a single process, two identical `forward` calls on freshly zeroed caches
-disagree. It is not a data race (1 thread reproduces it) and not heap-address
-dependence (same buffers both calls), which points at a buffer being read before
-it is fully written, with call 1's residue standing in for the missing writes.
-Runs often cluster — several consecutive runs agree bit-for-bit and then one
-diverges — which fits a buffer that is *usually* left in the same state.
+*Cause 2, still open.* A residue remains, and it is **intermittent** — the same
+size flips between runs:
+
+| tokens | run A | run B |
+|---|---|---|
+| 520 | 1.48 | — |
+| 600 | 0.00 | 0.00 |
+| 700 | 0.94 | — |
+| 800 | 0.00 | — |
+| 1024 | 0.00 | — |
+| 1200 | 1.95 | **0.00** |
+
+Ruled out: data race (1 thread reproduces), heap-address dependence (same
+buffers both calls), the ring mapping (all these sizes make ring capacity equal
+`max_len`, so ring and linear indexing coincide). Flakiness across *identical*
+configurations points at an uninitialised read whose value happens to be stable
+most of the time — the AMX kernels' stack `acc[4][256]` / `bt[4][1024]` and the
+M-tail paths (`mr0`/`mr1` < 16) are the prime suspects, since the failing sizes
+520 and 700 both hit tail paths.
+
+Note the bisect harness (`FGM_ZERO=all|<buffer>`, zeroes scratch at the top of
+each call) did **not** isolate it and in one run made things worse, which is
+itself evidence the source is kernel-local stack rather than a Rust-side buffer.
 
 Consequence to be honest about: **the 82.7% greedy-agreement figure has error
-bars I did not measure.** argmax still agrees between runs in the ring test, and
-the differing logits are in the same near-tie band that quantisation already
-perturbs, so the headline is probably not far off — but "probably" is not a
-measurement. Determinism has to be fixed before any accuracy number from this
-engine should be quoted, and before the llama.cpp comparison is worth running.
-
-Next diagnostic step: bisect by zeroing each scratch buffer at the top of every
-`forward_multi` call. Whichever buffer's zeroing makes the two runs agree is the
-one being read before it is written.
+bars I did not measure.** argmax agrees between runs in every ring test, and the
+differing logits sit in the same near-tie band quantisation already perturbs, so
+the headline is probably close — but "probably" is not a measurement. This gets
+fixed before any accuracy number is quoted as final and before the llama.cpp
+comparison is worth running.
 
 ---
 
