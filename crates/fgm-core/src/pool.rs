@@ -15,7 +15,6 @@ use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
 
 use fgm_kernels as k;
-pub use fgm_kernels::FaRow;
 
 #[derive(Clone, Copy)]
 pub struct GemmJob {
@@ -55,16 +54,12 @@ pub struct AttnJob {
     pub q: *const f32,
     /// `m` entries, one per row of the batch
     pub rows: *const RowRef,
-    /// same rows in the layout the blocked kernel expects
-    pub fa: *const FaRow,
     pub nh: usize,
     pub kvh: usize,
     pub hd: usize,
     pub m: usize,
     /// sliding window, or 0 for full attention
     pub window: usize,
-    /// use the blocked kernel (prefill); false keeps the per-(row, head) path
-    pub blocked: bool,
 }
 
 /// Rotate + quantise + tile-pack a GEMM activation, split by 16-row tile blocks.
@@ -196,27 +191,6 @@ fn run_prep(j: &PrepJob, b0: usize, b1: usize) {
     }
 }
 
-/// Query-row split for the blocked kernel, aligned to its block size so no two
-/// threads share a query block.
-const FA_BR: usize = 8;
-#[inline]
-fn split_blocked(m: usize, nt: usize, tid: usize) -> (usize, usize) {
-    let (a, b) = split_n(m.div_ceil(FA_BR), nt, tid);
-    (a * FA_BR, (b * FA_BR).min(m))
-}
-
-fn run_attn_blocked(j: &AttnJob, r0: usize, r1: usize, scratch: &mut [f32]) {
-    if r0 >= r1 {
-        return;
-    }
-    unsafe {
-        let rows = std::slice::from_raw_parts(j.fa, j.m);
-        let out = std::slice::from_raw_parts_mut(j.out, j.m * j.nh * j.hd);
-        let q = std::slice::from_raw_parts(j.q, j.m * j.nh * j.hd);
-        k::attend_blocked(out, q, rows, j.m, j.nh, j.kvh, j.hd, j.window, r0, r1, scratch);
-    }
-}
-
 impl Pool {
     pub fn new(nt: usize, scratch_len: usize) -> Self {
         assert!(nt >= 1);
@@ -243,10 +217,7 @@ impl Pool {
                             run_gemm(&g, a, b);
                         }
                         Job::Attn(at) => {
-                            if at.blocked {
-                                let (a, b) = split_blocked(at.m, nt, tid);
-                                run_attn_blocked(&at, a, b, &mut scratch);
-                            } else {
+                            {
                                 let (a, b) = split_n(at.m * at.nh, nt, tid);
                                 run_attn(&at, a, b, &mut scratch);
                             }
@@ -301,25 +272,19 @@ impl Pool {
         self.inner.done.wait();
     }
 
+    /// Attention, split across the pool by (row, head) pair. With one KV head
+    /// every query head reads the same cache lines, so this split gets cache
+    /// reuse between threads for free rather than partitioning against it.
     pub fn attn(&self, job: AttnJob) {
         let scratch = unsafe { &mut *self.scratch.get() };
         if self.nt == 1 {
-            if job.blocked {
-                run_attn_blocked(&job, 0, job.m, scratch);
-            } else {
-                run_attn(&job, 0, job.m * job.nh, scratch);
-            }
+            run_attn(&job, 0, job.m * job.nh, scratch);
             return;
         }
         unsafe { *self.inner.job.get() = Some(Job::Attn(job)) };
         self.inner.start.wait();
-        if job.blocked {
-            let (a, b) = split_blocked(job.m, self.nt, 0);
-            run_attn_blocked(&job, a, b, scratch);
-        } else {
-            let (a, b) = split_n(job.m * job.nh, self.nt, 0);
-            run_attn(&job, a, b, scratch);
-        }
+        let (a, b) = split_n(job.m * job.nh, self.nt, 0);
+        run_attn(&job, a, b, scratch);
         self.inner.done.wait();
     }
 

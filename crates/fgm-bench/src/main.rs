@@ -590,7 +590,7 @@ fn main() {
             let ctx = *pps.iter().max().unwrap() + maxtg + 8;
             let mut r = Runner::new(&model, chunk.max(conc), ctx, threads());
             println!("\n== (prompt x output) matrix, concurrency {conc}, chunk {chunk} ==");
-            println!("  attn {:?}  weights {:?}", r.attn, r.wsel);
+            println!("  weights {:?}", r.wsel);
             println!("  {:>7} {:>7} {:>9} {:>9} {:>10} {:>10} {:>10}",
                      "in", "out", "ttft_s", "gen_s", "pp_tok/s", "tg_tok/s", "req_tok/s");
             for &pp in &pps {

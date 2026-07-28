@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use crate::kv::KvCache;
 use crate::model::{Config, Model, QLinear};
-use crate::pool::{AttnJob, FaRow, GemmJob, Pool, PrepJob, RowRef};
+use crate::pool::{AttnJob, GemmJob, Pool, PrepJob, RowRef};
 use fgm_kernels as k;
 
 /// A weight the file may carry in two quantisations.
@@ -85,51 +85,6 @@ impl<'a> DualW<'a> {
 
     pub fn has_hi(&self) -> bool {
         self.hi.is_some()
-    }
-}
-
-/// When to use the blocked attention path instead of the per-(row, head) one.
-///
-/// This is deliberately a *shape* policy rather than a switch. The two paths
-/// have opposite scaling: blocking amortises a K/V block across a set of query
-/// rows, so it needs rows to pay off, while the per-head path gets its
-/// parallelism from (row, head) pairs and its cache residency for free as long
-/// as the K set fits in L2. Which of those dominates depends on both the row
-/// count and the context length, so a single global answer is wrong at one end
-/// or the other by construction.
-///
-/// Defaults are filled in from the measured table in `bench/ab_blocked.sh`;
-/// `FGM_BLOCKED=<min_m>:<max_ctx>` overrides for A/B (`0:0` disables).
-#[derive(Clone, Copy, Debug)]
-pub struct AttnPolicy {
-    /// blocked needs at least this many query rows
-    pub min_m: usize,
-    /// ...and a context no longer than this (0 disables blocking entirely)
-    pub max_ctx: usize,
-}
-
-impl AttnPolicy {
-    pub fn from_env() -> Self {
-        // Measured: blocking loses at 1024 (-8.8%), 2048 (-12.0%), 4096 (-8.4%)
-        // and 8192 (-7.1%). Whether it wins *below* 1024 is a separate question
-        // with a separate answer -- short contexts are where a K/V block is
-        // small enough that blocking's extra bookkeeping might be repaid.
-        // Default stays off until that end of the curve is measured; see
-        // `bench/ab_blocked.sh`.
-        let (mut min_m, mut max_ctx) = (16usize, 0usize);
-        if let Ok(v) = std::env::var("FGM_BLOCKED") {
-            let mut it = v.split(':');
-            min_m = it.next().and_then(|x| x.parse().ok()).unwrap_or(16);
-            max_ctx = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
-        } else if std::env::var_os("FGM_BLOCKED_ATTN").is_some() {
-            max_ctx = usize::MAX;
-        }
-        AttnPolicy { min_m, max_ctx }
-    }
-
-    #[inline]
-    pub fn blocked(&self, m: usize, ctx: usize) -> bool {
-        self.max_ctx > 0 && m >= self.min_m && ctx <= self.max_ctx
     }
 }
 
@@ -240,10 +195,6 @@ pub struct Runner<'m> {
     dump: Vec<f32>,
     /// Per-row KV view, rebuilt each layer (cheap: m entries).
     rows: Vec<RowRef>,
-    /// same rows in the blocked kernel's C layout
-    fa: Vec<FaRow>,
-    /// shape-conditional choice of attention path
-    pub attn: AttnPolicy,
     /// which of a dual-format weight's two quantisations each GEMM uses
     pub wsel: WeightSel,
     /// Per-phase seconds, accumulated when FGM_PROFILE is set.
@@ -370,7 +321,7 @@ impl<'m> Runner<'m> {
             },
             pool: Pool::new(
                 threads,
-                (max_ctx + 64).max(k::blocked_scratch(nh, hdmax, kvh)),
+                max_ctx + 64,
             ),
             layers,
             model,
@@ -384,15 +335,6 @@ impl<'m> Runner<'m> {
                 };
                 m
             ],
-            fa: vec![
-                FaRow {
-                    kc: std::ptr::null(), vc: std::ptr::null(),
-                    ks: std::ptr::null(), vs: std::ptr::null(),
-                    k_len: 0, pos: 0,
-                };
-                m
-            ],
-            attn: AttnPolicy::from_env(),
             wsel: WeightSel::from_env(),
             prof: [0.0; NPHASE],
             profiling: std::env::var_os("FGM_PROFILE").is_some(),
@@ -588,36 +530,16 @@ impl<'m> Runner<'m> {
                     pos: pos[r],
                     ring,
                 };
-                self.fa[r] = FaRow {
-                    kc: lk.k.as_ptr(),
-                    vc: lk.v.as_ptr(),
-                    ks: lk.ks.as_ptr(),
-                    vs: lk.vs.as_ptr(),
-                    k_len: ring as i32,
-                    pos: pos[r] as i32,
-                };
             }
-            // Which attention path to run is a *shape* decision, not a global
-            // one. See `AttnPolicy` for the measured table behind the default.
-            //
-            // It is only *correct* to block when every row reads the same cache,
-            // because the block shares one K view. That holds for chunked
-            // prefill (one sequence at a time) but not for batched decode, where
-            // each row is a different sequence.
-            let same_cache = seq[..m].iter().all(|&x| x == seq[0]);
-            let ctx = pos[..m].iter().copied().max().unwrap_or(0) + 1;
-            let blocked = same_cache && self.attn.blocked(m, ctx);
             self.pool.attn(AttnJob {
                 out: b.ao.as_mut_ptr(),
                 q: b.q.as_ptr(),
                 rows: self.rows.as_ptr(),
-                fa: self.fa.as_ptr(),
                 nh,
                 kvh,
                 hd,
                 m,
                 window: if w.sliding { cfg.sliding_window } else { 0 },
-                blocked,
             });
 
             tock!(_t, prof, 5);
