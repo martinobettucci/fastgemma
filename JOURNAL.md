@@ -305,6 +305,27 @@ Always check for background load before trusting a delta.
 read, which does not grow with batch size, so this is the expected shape — and
 it is also exactly why MTP speculation should pay here.
 
+### Long-context prefill: attention, not GEMM, is the wall
+
+Running the real 8×8k target workload exposed the next bottleneck. Rough op
+counts for one 8192-token prefill:
+
+- GEMM: 8192 × 3.73 GOP/token ≈ **30.5 TOP**
+- attention: 28 sliding layers are cheap (window 512) at ≈ 0.96 TOP total, but
+  the **7 full-attention layers are O(M²)** at ≈ 3.85 TOP — and they run
+  `head_dim` 512, double the sliding layers.
+
+So attention is ~14% of the ops but a much larger share of the time, because the
+attention kernel is naive: f32, one int8 KV element dequantised at a time, no
+blocking, softmax over the whole row in one pass. The GEMM path has had three
+rounds of tuning; attention has had none.
+
+Next steps there, in order of expected payoff:
+1. Flash-attention-style tiling so K/V stay in L1 and softmax is online.
+2. Feed Q·Kᵀ through AMX as well — it is an int8 × int8 GEMM in disguise
+   (`q_norm` already bounds Q's range), which is the same 12.7× lever.
+3. Skip the sliding layers' out-of-window positions in the *scale* array too.
+
 ---
 
 ## 7. Constrained tool calling
