@@ -130,8 +130,6 @@ pub struct Runner<'m> {
     dump: Vec<f32>,
     /// Per-row KV view, rebuilt each layer (cheap: m entries).
     rows: Vec<RowRef>,
-    seq_buf: Vec<usize>,
-    pos_buf: Vec<usize>,
     /// Per-phase seconds, accumulated when FGM_PROFILE is set.
     pub prof: [f64; NPHASE],
     profiling: bool,
@@ -252,12 +250,10 @@ impl<'m> Runner<'m> {
                 RowRef {
                     kc: std::ptr::null(), ks: std::ptr::null(),
                     vc: std::ptr::null(), vs: std::ptr::null(),
-                    k_len: 0, pos: 0,
+                    k_len: 0, pos: 0, ring: 0,
                 };
                 m
             ],
-            seq_buf: Vec::with_capacity(m),
-            pos_buf: Vec::with_capacity(m),
             prof: [0.0; NPHASE],
             profiling: std::env::var_os("FGM_PROFILE").is_some(),
         }
@@ -267,17 +263,13 @@ impl<'m> Runner<'m> {
     /// logits for the final token only.
     pub fn forward(&mut self, tokens: &[u32], pos0: usize, kv: &mut KvCache) -> &[f32] {
         let m = tokens.len();
-        self.seq_buf.clear();
-        self.seq_buf.extend(std::iter::repeat(0).take(m));
-        self.pos_buf.clear();
-        self.pos_buf.extend(pos0..pos0 + m);
-        let (seq, pos) = (std::mem::take(&mut self.seq_buf), std::mem::take(&mut self.pos_buf));
-        let caches = std::slice::from_mut(kv);
-        let out = self.forward_multi(tokens, &seq, &pos, caches, &[m - 1]).as_ptr();
-        let n = self.cfg.vocab_size;
-        self.seq_buf = seq;
-        self.pos_buf = pos;
-        unsafe { std::slice::from_raw_parts(out, n) }
+        // Local, not scratch fields: taking them out of `self` and putting them
+        // back around the call meant reconstructing the returned slice from a
+        // raw pointer to dodge the borrow checker. m is at most a prefill chunk,
+        // so two small Vecs per call are free next to the forward pass itself.
+        let seq = vec![0usize; m];
+        let pos: Vec<usize> = (pos0..pos0 + m).collect();
+        self.forward_multi(tokens, &seq, &pos, std::slice::from_mut(kv), &[m - 1])
     }
 
     /// Batched forward. Row `r` carries `tokens[r]` for sequence `seq[r]` at
@@ -402,6 +394,11 @@ impl<'m> Runner<'m> {
             let _t = tick!(profiling);
             for r in 0..m {
                 let lk = caches[seq[r]].layers[w.kv_src].as_ref().unwrap();
+                debug_assert!(
+                    !lk.ring || m + cfg.sliding_window <= lk.capacity,
+                    "ring cache holds {} but a batch of {m} rows with window {} needs {}",
+                    lk.capacity, cfg.sliding_window, m + cfg.sliding_window
+                );
                 self.rows[r] = RowRef {
                     kc: lk.k.as_ptr(),
                     ks: lk.ks.as_ptr(),
@@ -409,6 +406,7 @@ impl<'m> Runner<'m> {
                     vs: lk.vs.as_ptr(),
                     k_len: lk.capacity,
                     pos: pos[r],
+                    ring: if lk.ring { lk.capacity } else { 0 },
                 };
             }
             self.pool.attn(AttnJob {

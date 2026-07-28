@@ -42,7 +42,23 @@ pub struct KvCache {
 }
 
 impl KvCache {
-    pub fn new(cfg: &Config, max_len: usize) -> Self {
+    /// `max_batch` is the largest number of rows a single forward will submit
+    /// (the prefill chunk size). A ring layer must hold `sliding_window +
+    /// max_batch` positions, not merely `sliding_window`: a batched forward
+    /// writes all its rows before any attention runs, so with only `window`
+    /// slots the later rows overwrite history the earlier rows still need. That
+    /// produces silently wrong logits, not a crash.
+    pub fn new(cfg: &Config, max_len: usize, max_batch: usize) -> Self {
+        Self::build(cfg, max_len, max_batch, true)
+    }
+
+    /// Every KV layer full length, no ring buffers. Only for the regression
+    /// test that ring-mapped reads match linear ones — it costs more memory.
+    pub fn new_no_ring(cfg: &Config, max_len: usize) -> Self {
+        Self::build(cfg, max_len, 0, false)
+    }
+
+    fn build(cfg: &Config, max_len: usize, max_batch: usize, allow_ring: bool) -> Self {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for l in 0..cfg.num_hidden_layers {
             if cfg.is_shared(l) {
@@ -52,8 +68,13 @@ impl KvCache {
             let hd = cfg.head_dim_of(l);
             let kvh = cfg.num_key_value_heads;
             // A sliding layer needs full length only if a shared layer reads it.
-            let needs_full = !cfg.is_sliding(l) || cfg.store_full_length_kv.contains(&l);
-            let cap = if needs_full { max_len } else { cfg.sliding_window };
+            let needs_full =
+                !allow_ring || !cfg.is_sliding(l) || cfg.store_full_length_kv.contains(&l);
+            let cap = if needs_full {
+                max_len
+            } else {
+                (cfg.sliding_window + max_batch).min(max_len)
+            };
             layers.push(Some(LayerKv {
                 capacity: cap,
                 head_dim: hd,

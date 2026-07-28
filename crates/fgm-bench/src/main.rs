@@ -56,7 +56,7 @@ fn main() {
         "dump" => {
             let toks: Vec<u32> = args[3].split(',').map(|x| x.parse().unwrap()).collect();
             let m = toks.len();
-            let mut caches = vec![KvCache::new(&cfg, m + 8)];
+            let mut caches = vec![KvCache::new(&cfg, m + 8, m)];
             let mut r = Runner::with_logit_rows(&model, m.max(8), m + 8, threads(), m);
             let seq = vec![0usize; m];
             let pos: Vec<usize> = (0..m).collect();
@@ -84,7 +84,7 @@ fn main() {
             println!("  {:>7} {:>10} {:>12} {:>10}", "tokens", "time", "tok/s", "ms/tok");
             for &n in &[64usize, 128, 256, 512] {
                 let toks = synth_tokens(n, 7);
-                let mut kv = KvCache::new(&cfg, n + 8);
+                let mut kv = KvCache::new(&cfg, n + 8, n);
                 let mut r = Runner::new(&model, n, n + 8, threads());
                 let t = Instant::now();
                 r.forward(&toks, 0, &mut kv);
@@ -107,7 +107,7 @@ fn main() {
             println!("\n== decode throughput, 1 sequence ==");
             let ctx = 640usize;
             let prompt = synth_tokens(128, 11);
-            let mut kv = KvCache::new(&cfg, ctx);
+            let mut kv = KvCache::new(&cfg, ctx, 128);
             let mut r = Runner::new(&model, 128, ctx, threads());
             r.forward(&prompt, 0, &mut kv);
             let mut pos = prompt.len();
@@ -134,7 +134,7 @@ fn main() {
             let ctx = pin + pout + 8;
             println!("\n== serve: {conc} concurrent, {pin} in / {pout} out, prefill chunk {chunk} ==");
 
-            let mut caches: Vec<KvCache> = (0..conc).map(|_| KvCache::new(&cfg, ctx)).collect();
+            let mut caches: Vec<KvCache> = (0..conc).map(|_| KvCache::new(&cfg, ctx, chunk)).collect();
             println!("  kv {:.0} MB total ({:.1} MB/seq at {} ctx)",
                      caches.iter().map(|c| c.bytes()).sum::<usize>() as f64 / 1e6,
                      caches[0].bytes() as f64 / 1e6, ctx);
@@ -256,6 +256,46 @@ fn main() {
                     println!("  -> tool={name} args={nargs} (expected {nparams})");
                 }
                 Err(e) => println!("  emitted text PARSES as JSON: false ({e})"),
+            }
+        }
+
+        // Regression guard for the ring-buffer KV bug: sliding layers that are
+        // not a shared-KV source store only `sliding_window` positions, so both
+        // the write and the read path must map absolute positions through the
+        // ring. Reading linearly walks off the allocation once the context
+        // passes the window -- a segfault at 8k that no test under 512 tokens
+        // could reach. This runs past the window and requires bit-identical
+        // logits against an all-full-length cache.
+        "ringtest" => {
+            let n: usize = args.get(3).and_then(|v| v.parse().ok()).unwrap_or(1200);
+            assert!(n > cfg.sliding_window, "must exceed the sliding window to be a test");
+            println!("\n== ring-buffer KV regression: {n} tokens (window {}) ==",
+                     cfg.sliding_window);
+            let toks = synth_tokens(n, 3);
+            let mut r = Runner::new(&model, n, n + 8, threads());
+
+            let mut kv_ring = KvCache::new(&cfg, n + 8, n);
+            let mut kv_full = KvCache::new_no_ring(&cfg, n + 8);
+            println!("  ring cache {:.1} MB   full cache {:.1} MB",
+                     kv_ring.bytes() as f64 / 1e6, kv_full.bytes() as f64 / 1e6);
+
+            // First establish that the engine is deterministic at all, so a
+            // ring-vs-linear difference can be attributed to the ring.
+            let a: Vec<f32> = r.forward(&toks, 0, &mut kv_ring).to_vec();
+            let mut kv_ring2 = KvCache::new(&cfg, n + 8, n);
+            let a2: Vec<f32> = r.forward(&toks, 0, &mut kv_ring2).to_vec();
+            let selfdiff = a.iter().zip(&a2).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            println!("  self-determinism (same path twice): max abs diff {selfdiff:.6}");
+            let b: Vec<f32> = r.forward(&toks, 0, &mut kv_full).to_vec();
+            let maxdiff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            let same_argmax = argmax(&a) == argmax(&b);
+            println!("  max abs logit diff  {maxdiff:.6}");
+            println!("  argmax agrees       {same_argmax}");
+            if maxdiff == 0.0 && same_argmax {
+                println!("  PASS - ring-mapped reads are identical to linear reads");
+            } else {
+                println!("  FAIL");
+                std::process::exit(1);
             }
         }
 

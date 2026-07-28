@@ -44,6 +44,8 @@ pub struct RowRef {
     pub vs: *const f32,
     pub k_len: usize,
     pub pos: usize,
+    /// ring-buffer capacity for sliding layers, 0 if the cache is full length
+    pub ring: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -147,7 +149,8 @@ fn run_attn(j: &AttnJob, i0: usize, i1: usize, scratch: &mut [f32]) {
             let vs = std::slice::from_raw_parts(rr.vs, rr.k_len);
             let out = std::slice::from_raw_parts_mut(j.out.add((r * nh + h) * hd), hd);
             let q = std::slice::from_raw_parts(j.q.add((r * nh + h) * hd), hd);
-            k::attend_q8_heads(out, q, kc, ks, vc, vs, nh, j.kvh, hd, st, en, scratch, 0, 1);
+            k::attend_q8_heads(out, q, kc, ks, vc, vs, nh, j.kvh, hd, st, en,
+                               scratch, 0, 1, rr.ring);
         }
     }
 }

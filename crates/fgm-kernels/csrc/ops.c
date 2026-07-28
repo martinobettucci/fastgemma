@@ -261,7 +261,7 @@ void fgm_softcap(float *x, int n, float cap) {
 // ---------------------------------------------------------------- attention
 void fgm_attend_q8_heads(float *, const float *, const int8_t *, const float *,
                          const int8_t *, const float *, int, int, int, int, int,
-                         float *, int, int);
+                         float *, int, int, int);
 // One query row against a contiguous int8 KV cache for one layer.
 //   k_cache / v_cache: [n_ctx, kv_heads * head_dim] int8 with per-(pos) scale
 //   q: [n_heads, head_dim] f32
@@ -272,29 +272,37 @@ void fgm_attend_q8(float *out, const float *q, const int8_t *kc, const float *ks
                    const int8_t *vc, const float *vs, int n_heads, int kv_heads,
                    int head_dim, int start, int end, float *scratch) {
   fgm_attend_q8_heads(out, q, kc, ks, vc, vs, n_heads, kv_heads, head_dim,
-                      start, end, scratch, 0, n_heads);
+                      start, end, scratch, 0, n_heads, 0);
 }
 
 // Same, restricted to heads [h0, h1) so the work can be split across threads.
+//
+// `ring` is the cache capacity for sliding layers whose KV lives in a ring
+// buffer (0 = linear, full-length cache). Absolute positions must be mapped
+// through it exactly as the write path does via LayerKv::slot -- reading a ring
+// cache by absolute position walks off the end of the allocation the moment the
+// context passes the window, which is how this was found: a segfault at 8k that
+// no test under 512 tokens could reach.
 void fgm_attend_q8_heads(float *out, const float *q, const int8_t *kc, const float *ks,
                          const int8_t *vc, const float *vs, int n_heads, int kv_heads,
                          int head_dim, int start, int end, float *scratch,
-                         int h0, int h1) {
+                         int h0, int h1, int ring) {
   const int kvd = kv_heads * head_dim;
   const int grp = n_heads / kv_heads;
+#define KVSLOT(t) ((ring) ? ((t) % (ring)) : (t))
   for (int h = h0; h < h1; h++) {
     const float *qh = q + (size_t)h * head_dim;
     const int kvh = h / grp;
     float *sc = scratch;
     float mx = -INFINITY;
     for (int t = start; t < end; t++) {
-      const int8_t *kp = kc + (size_t)t * kvd + kvh * head_dim;
+      const int8_t *kp = kc + (size_t)KVSLOT(t) * kvd + kvh * head_dim;
       __m512 acc = _mm512_setzero_ps();
       for (int i = 0; i < head_dim; i += 16) {
         __m512i kv = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(kp + i)));
         acc = _mm512_fmadd_ps(_mm512_loadu_ps(qh + i), _mm512_cvtepi32_ps(kv), acc);
       }
-      float s = _mm512_reduce_add_ps(acc) * ks[t];
+      float s = _mm512_reduce_add_ps(acc) * ks[KVSLOT(t)];
       sc[t - start] = s;
       if (s > mx) mx = s;
     }
@@ -304,9 +312,9 @@ void fgm_attend_q8_heads(float *out, const float *q, const int8_t *kc, const flo
     float *oh = out + (size_t)h * head_dim;
     for (int i = 0; i < head_dim; i += 16) _mm512_storeu_ps(oh + i, _mm512_setzero_ps());
     for (int t = start; t < end; t++) {
-      float w = sc[t - start] * inv * vs[t];
+      float w = sc[t - start] * inv * vs[KVSLOT(t)];
       if (w == 0.0f) continue;
-      const int8_t *vp = vc + (size_t)t * kvd + kvh * head_dim;
+      const int8_t *vp = vc + (size_t)KVSLOT(t) * kvd + kvh * head_dim;
       __m512 wv = _mm512_set1_ps(w);
       for (int i = 0; i < head_dim; i += 16) {
         __m512i vv = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(vp + i)));
@@ -315,6 +323,7 @@ void fgm_attend_q8_heads(float *out, const float *q, const int8_t *kc, const flo
       }
     }
   }
+#undef KVSLOT
 }
 
 // Quantise one KV row (kv_heads*head_dim f32) to int8 with a single scale.

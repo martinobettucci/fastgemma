@@ -339,6 +339,58 @@ running" as a claim needing evidence (load average was 0.00 the whole time).
 
 ---
 
+## 6b. Two KV bugs and one open defect (found by running the real workload)
+
+The full 8×8k serve run is what exposed all of this. Nothing under 512 tokens
+could reach any of it.
+
+**Bug A — ring-buffer KV read by absolute position. Segfault.**
+Sliding layers that are not a shared-KV source store only `sliding_window`
+positions in a ring. The *write* path mapped through `LayerKv::slot(pos)`; the
+*read* path in attention indexed by absolute position. Past position 512 it read
+hundreds of KB off the end of the allocation. Every sweep so far used ctx ≤ 640,
+so it never fired. Fixed by threading the ring capacity into
+`fgm_attend_q8_heads` and mapping reads through it. An earlier draft of the
+forward pass literally had `debug_assert!(!lk.ring, "ring windows need
+slot-mapped attention")` — I deleted the assert during a refactor instead of
+implementing what it demanded, and release builds skip `debug_assert!` anyway.
+
+**Bug B — a ring sized `window` is too small for a batched forward.**
+Fixing A turned the segfault into wrong answers. A batched forward writes *all*
+m rows before any attention runs, so with only `window` slots the later rows
+overwrite history the earlier rows still need. A ring must hold
+`sliding_window + max_batch`. Fixed, with a `debug_assert` that states the
+requirement. This one produces silently wrong logits, not a crash — much worse.
+
+**Open defect — the engine is not deterministic.**
+The regression test that caught B also caught this, and it is not fixed:
+
+| threads | same inputs, two runs, max abs logit diff |
+|---|---|
+| 1 | up to 2.85 |
+| 2 | 1.35 |
+| 4 | 7.35 – 7.73 |
+
+Within a single process, two identical `forward` calls on freshly zeroed caches
+disagree. It is not a data race (1 thread reproduces it) and not heap-address
+dependence (same buffers both calls), which points at a buffer being read before
+it is fully written, with call 1's residue standing in for the missing writes.
+Runs often cluster — several consecutive runs agree bit-for-bit and then one
+diverges — which fits a buffer that is *usually* left in the same state.
+
+Consequence to be honest about: **the 82.7% greedy-agreement figure has error
+bars I did not measure.** argmax still agrees between runs in the ring test, and
+the differing logits are in the same near-tie band that quantisation already
+perturbs, so the headline is probably not far off — but "probably" is not a
+measurement. Determinism has to be fixed before any accuracy number from this
+engine should be quoted, and before the llama.cpp comparison is worth running.
+
+Next diagnostic step: bisect by zeroing each scratch buffer at the top of every
+`forward_multi` call. Whichever buffer's zeroing makes the two runs agree is the
+one being read before it is written.
+
+---
+
 ## 7. Constrained tool calling
 
 DFA over the tool schemas → per-state token bitset. On the real 262144-token

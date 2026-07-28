@@ -45,7 +45,7 @@ extern "C" {
         out: *mut f32, q: *const f32, kc: *const i8, ks: *const f32,
         vc: *const i8, vs: *const f32, n_heads: i32, kv_heads: i32,
         head_dim: i32, start: i32, end: i32, scratch: *mut f32,
-        h0: i32, h1: i32,
+        h0: i32, h1: i32, ring: i32,
     );
 }
 
@@ -208,20 +208,25 @@ pub fn attend_q8(
 
 /// Attention restricted to heads `[h0, h1)`, so the pool can split the work.
 /// `q` and `out` point at the first head in the range, not at head 0.
+///
+/// `ring` is the KV cache capacity for sliding layers stored in a ring buffer
+/// (0 = linear). It MUST match what the write path used, or reads run off the
+/// end of the allocation once the context passes the window.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub fn attend_q8_heads(
     out: &mut [f32], q: &[f32], kc: &[i8], ks: &[f32], vc: &[i8], vs: &[f32],
     n_heads: usize, kv_heads: usize, head_dim: usize, start: usize, end: usize,
-    scratch: &mut [f32], h0: usize, h1: usize,
+    scratch: &mut [f32], h0: usize, h1: usize, ring: usize,
 ) {
     debug_assert!(scratch.len() >= end - start);
+    debug_assert!(ring == 0 || kc.len() >= ring * kv_heads * head_dim);
     unsafe {
         fgm_attend_q8_heads(
             out.as_mut_ptr(), q.as_ptr(), kc.as_ptr(), ks.as_ptr(),
             vc.as_ptr(), vs.as_ptr(), n_heads as i32, kv_heads as i32,
             head_dim as i32, start as i32, end as i32, scratch.as_mut_ptr(),
-            h0 as i32, h1 as i32,
+            h0 as i32, h1 as i32, ring as i32,
         )
     }
 }
