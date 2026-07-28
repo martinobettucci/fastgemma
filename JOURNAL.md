@@ -1234,3 +1234,68 @@ Removed rather than tuned, because there is no threshold that separates
 self-load from competitor-load with this signal. **A guard that cries wolf is
 worse than no guard**: the next real warning gets read as noise, which is
 exactly the failure the guard exists to prevent.
+
+
+---
+
+## 19. The attention ceiling probe, and why AMX is the wrong tool
+
+Before starting an AMX attention rewrite I measured what the kernel actually
+achieves, because the previous two times I picked an attention optimisation from
+a first-principles estimate I was wrong: once by assuming KV re-reads hit DRAM
+when they were L2-resident (§12), once by putting attention at 11% of prefill
+when it was 61.9% (§14).
+
+`bench/kernels/attn_bench.c`, 16 query rows against a full context, 8 heads:
+
+| head_dim | ctx | G MAC/s | % VNNI peak |
+|---|---|---|---|
+| 256 | 512 | 32.5 | 5.6% |
+| 256 | 1024 | 36.7 | 6.3% |
+| 256 | 2048 | 33.4 | 5.8% |
+| 256 | 4096 | 22.5 | 3.9% |
+| 256 | 8192 | 18.7 | 3.2% |
+| 512 | 512 | 39.5 | 6.8% |
+| 512 | 1024 | 41.3 | 7.1% |
+| 512 | 2048 | 27.8 | 4.8% |
+| 512 | 4096 | 21.1 | 3.6% |
+| 512 | 8192 | 21.1 | 3.6% |
+
+**AMX is the wrong tool, and the reason is arithmetic intensity.** With one KV
+head every MAC consumes exactly one byte of K or V — intensity is *1 MAC per
+byte*. That puts a hard ceiling of 33 G MAC/s from DRAM and 209 G MAC/s from L2,
+regardless of how fast the multiplier is. AMX's 12.7× advantage over VNNI is an
+advantage in **instructions**, and instructions are not what is scarce here: the
+kernel runs at 3–7% of the VNNI ceiling it already has. Building AMX attention
+would have been days of work against a ceiling that is not binding.
+
+*Caveat on the probe, stated because it matters:* for this model `kv_heads *
+head_dim == head_dim`, so bytes-touched and MACs are numerically identical and
+the GB/s column is not independent evidence — it is the MAC column relabelled.
+The conclusion rests on the %VNNI column and on the intensity argument, not on
+two agreeing measurements.
+
+### What the numbers actually point at
+
+The kernel is neither instruction-bound (3–7% of VNNI) nor cleanly
+bandwidth-bound at short context (39.5 GB/s against L2's 209). At 8192 it sits
+at 21 G MAC/s, at or below the 33 G MAC/s DRAM ceiling — because K and V for one
+full-attention layer are 4 MB each at that length and no longer fit L2, so the
+eight per-head passes over the same range stop hitting cache.
+
+So the levers are, in order:
+
+1. **Fewer bytes.** int4 KV halves them. Block top-k sparsity cuts the number of
+   positions read. Both attack the binding constraint directly.
+2. **Less per-(row, head) overhead.** The u8 weight fill in P·V is a *scalar*
+   loop over the whole score range — at ctx 512 it costs roughly as much as the
+   entire Q·Kᵀ dot product it feeds. Vectorising it is cheap and clear.
+3. **Fewer re-reads.** Eight query heads re-stream the same K range because the
+   loop is `for head { for position }`. Inverting that is what blocked attention
+   attempted; it lost for other reasons (§12), but the traffic argument was
+   never the flawed part.
+
+**Trap 17 — a speedup ratio is only as real as the ceiling it is measured
+against.** "AMX is 12.7× VNNI" is true and was nearly decisive. It is also
+irrelevant to a kernel that uses 5% of VNNI, and nothing about the ratio itself
+says so. The number that mattered was one nobody quotes: bytes per MAC.

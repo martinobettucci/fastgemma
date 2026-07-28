@@ -876,7 +876,7 @@ fn main() {
             let shared = synth_tokens(pre, 7);
             let tails: Vec<Vec<u32>> = (0..conc).map(|i| synth_tokens(suf, 100 + i as u64)).collect();
 
-            let mut prefill = |r: &mut Runner, c: &mut KvCache, t: &[u32], base: usize| -> u32 {
+            let prefill = |r: &mut Runner, c: &mut KvCache, t: &[u32], base: usize| -> u32 {
                 let mut off = 0;
                 let mut last = 0u32;
                 while off < t.len() {
