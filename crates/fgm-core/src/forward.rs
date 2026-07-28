@@ -133,8 +133,9 @@ pub struct Runner<'m> {
     rows: Vec<RowRef>,
     /// same rows in the blocked kernel's C layout
     fa: Vec<FaRow>,
-    /// FGM_NO_BLOCKED_ATTN=1 forces the per-(row, head) path, for A/B testing
-    no_blocked: bool,
+    /// FGM_BLOCKED_ATTN=1 opts into the blocked path (off by default; see the
+    /// gate in `forward_multi` for the measurements that put it there)
+    blocked_attn: bool,
     /// Per-phase seconds, accumulated when FGM_PROFILE is set.
     pub prof: [f64; NPHASE],
     profiling: bool,
@@ -281,7 +282,7 @@ impl<'m> Runner<'m> {
                 };
                 m
             ],
-            no_blocked: std::env::var_os("FGM_NO_BLOCKED_ATTN").is_some(),
+            blocked_attn: std::env::var_os("FGM_BLOCKED_ATTN").is_some(),
             prof: [0.0; NPHASE],
             profiling: std::env::var_os("FGM_PROFILE").is_some(),
         }
@@ -470,16 +471,25 @@ impl<'m> Runner<'m> {
                     pos: pos[r] as i32,
                 };
             }
-            // Blocking only pays when there are enough query rows to amortise a
-            // K/V block; at m=1 (decode) the KV range is read once anyway and
-            // row-splitting would leave threads idle, so keep the per-head path.
+            // Blocked attention is OFF by default: measured, it loses at every
+            // context we serve (-8.8% at 1024, -12.0% at 2048, -8.4% at 4096).
+            // The premise was wrong, not the implementation. Blocking exists to
+            // keep re-read K/V in cache, but with 1 KV head the int8 K set is
+            // only 0.5 MB at 2k and 2 MB at 8k, so it is already L2-resident on
+            // the per-head path -- there was no DRAM traffic to save, and the
+            // online-softmax rescaling per block is pure added cost.
             //
-            // It is also only *correct* when every row in a block reads the same
-            // cache, because the block's K is dequantised once and shared. That
-            // holds for chunked prefill (one sequence at a time) but not for
-            // batched decode, where each row is a different sequence.
+            // Kept behind FGM_BLOCKED_ATTN=1 rather than deleted, because it is
+            // the path that wins once K/V genuinely exceeds L2 (much longer
+            // context, or more KV heads as in E4B), and re-deriving it later is
+            // more expensive than carrying it.
+            //
+            // It is only *correct* when every row in a block reads the same
+            // cache, because the block shares one K view. That holds for chunked
+            // prefill (one sequence at a time) but not for batched decode, where
+            // each row is a different sequence.
             let same_cache = seq[..m].iter().all(|&x| x == seq[0]);
-            let blocked = m >= 16 && same_cache && !self.no_blocked;
+            let blocked = m >= 16 && same_cache && self.blocked_attn;
             self.pool.attn(AttnJob {
                 out: b.ao.as_mut_ptr(),
                 q: b.q.as_ptr(),
