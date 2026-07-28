@@ -872,6 +872,7 @@ fn main() {
             let mut nprompt = 0usize;
             let mut ngenerated = 0usize;
             let mut forced_steps = 0usize;
+            let (mut mtp_batched, mut mtp_drafted, mut mtp_accepted) = (0usize, 0usize, 0usize);
             let t_all = Instant::now();
             for toks in &lines {
                 let mut cache = KvCache::new(&cfg, ctx, chunk);
@@ -894,14 +895,124 @@ fn main() {
                     off += n;
                 }
                 if let Some(c) = con.as_mut() { c.advance(tok as usize); }
+                // ---------------------------------------------- MTP paths
+                // Both are OFF by default and exist to be A/B'd. Neither has
+                // been benchmarked end to end: the host lost its AMX units
+                // before that was possible, so these ship measured only at the
+                // DFA/tokeniser level (JOURNAL 28).
+                //
+                //   FGM_MTP_GRAMMAR=1  batch runs of DFA-forced tokens. EXACT:
+                //                      a forced token is determined by the
+                //                      grammar alone, so there is nothing to
+                //                      verify. Sized at ~11% of decode steps.
+                //   FGM_MTP_LOOKUP=k   prompt-lookup speculation, drafting up
+                //                      to k tokens by finding the last 2 emitted
+                //                      tokens in the prompt and copying what
+                //                      followed. Sized at 21.6% draft accuracy
+                //                      on the eval's tool calls. Verified
+                //                      against the model, so acceptance is
+                //                      checked, never assumed.
+                let mtp_grammar = std::env::var_os("FGM_MTP_GRAMMAR").is_some();
+                let lookahead: usize =
+                    std::env::var("FGM_MTP_LOOKUP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+                let vsz = cfg.vocab_size;
+
                 let mut out = Vec::with_capacity(ngen);
                 let mut pos = toks.len();
-                for _ in 0..ngen {
+                while out.len() < ngen {
                     if eos.contains(&tok) { break; }
                     out.push(tok);
                     if con.as_ref().map(|c| c.done()).unwrap_or(false) { break; }
-                    // A forced step needs no logits at all -- the mask admits one
-                    // token, so the 201 MB LM-head read is skipped outright.
+
+                    // --- exact path: emit the whole forced run in one forward
+                    if mtp_grammar {
+                        let run: Vec<u32> = con.as_ref()
+                            .map(|c| c.forced_run(15).into_iter().map(|t| t as u32).collect())
+                            .unwrap_or_default();
+                        if run.len() > 1 && out.len() + run.len() <= ngen {
+                            // [tok, run[0..k-1]] advances KV for all of them;
+                            // logits come from the last row, which is the first
+                            // position the grammar does NOT determine.
+                            let mut batch = Vec::with_capacity(run.len());
+                            batch.push(tok);
+                            batch.extend_from_slice(&run[..run.len() - 1]);
+                            let lg = r.forward(&batch, pos, &mut cache);
+                            let mut v = lg.to_vec();
+                            for &t in &run { out.push(t); }
+                            let last = *run.last().unwrap();
+                            if let Some(c) = con.as_mut() {
+                                for &t in &run { c.advance(t as usize); }
+                                c.apply(&mut v);
+                            }
+                            let _ = &v;
+                            mtp_batched += run.len() - 1;
+                            pos += batch.len();
+                            // `last` was emitted but its KV is not written yet;
+                            // it becomes the next step's `tok`.
+                            tok = last;
+                            out.pop();
+                            continue;
+                        }
+                    }
+
+                    // --- speculative path: draft from the prompt, verify
+                    if lookahead > 0 && out.len() >= 2 {
+                        let ng = [out[out.len() - 2], out[out.len() - 1]];
+                        let mut draft: Vec<u32> = Vec::new();
+                        if let Some(j) = (2..toks.len())
+                            .rev()
+                            .find(|&j| toks[j - 2] == ng[0] && toks[j - 1] == ng[1])
+                        {
+                            for d in 0..lookahead.min(toks.len() - j) {
+                                draft.push(toks[j + d]);
+                            }
+                        }
+                        if !draft.is_empty() && out.len() + draft.len() + 1 <= ngen {
+                            let mut batch = Vec::with_capacity(draft.len() + 1);
+                            batch.push(tok);
+                            batch.extend_from_slice(&draft);
+                            let seq1 = vec![0usize; batch.len()];
+                            let posv: Vec<usize> = (pos..pos + batch.len()).collect();
+                            let rows: Vec<usize> = (0..batch.len()).collect();
+                            let lg = r.forward_multi(&batch, &seq1, &posv, std::slice::from_mut(&mut cache), &rows)
+                                .to_vec();
+                            // Verify sequentially. Row i predicts the token that
+                            // should follow batch[i], so row i is the check on
+                            // draft[i].
+                            let mut acc = 0usize;
+                            let mut next = tok;
+                            for i in 0..draft.len() {
+                                let mut v = lg[i * vsz..(i + 1) * vsz].to_vec();
+                                if let Some(c) = con.as_ref() { c.apply(&mut v); }
+                                let want = argmax(&v) as u32;
+                                if want == draft[i] {
+                                    out.push(want);
+                                    if let Some(c) = con.as_mut() { c.advance(want as usize); }
+                                    acc += 1;
+                                    next = want;
+                                } else {
+                                    next = want;
+                                    break;
+                                }
+                            }
+                            mtp_drafted += draft.len();
+                            mtp_accepted += acc;
+                            // KV past the accepted prefix holds rejected tokens;
+                            // it is never read, because the next forward writes
+                            // those same positions before any attention reads
+                            // beyond `pos`.
+                            pos += acc + 1;
+                            if acc == 0 {
+                                if let Some(c) = con.as_mut() { c.advance(next as usize); }
+                            }
+                            tok = next;
+                            out.pop();
+                            out.push(batch[0]);
+                            continue;
+                        }
+                    }
+
+                    // --- ordinary single-token step
                     if let Some(f) = con.as_ref().and_then(|c| c.forced()) {
                         forced_steps += 1;
                         r.forward_nolm(&[tok], pos, &mut cache);
@@ -928,6 +1039,13 @@ fn main() {
             if con.is_some() {
                 eprintln!("forced steps (LM head skipped): {forced_steps}/{ngenerated} = {:.0}%",
                           100.0 * forced_steps as f64 / ngenerated.max(1) as f64);
+            }
+            if mtp_batched > 0 {
+                eprintln!("MTP grammar: {mtp_batched} decode steps collapsed by batching forced runs");
+            }
+            if mtp_drafted > 0 {
+                eprintln!("MTP lookup: {mtp_accepted}/{mtp_drafted} drafted tokens accepted = {:.0}%",
+                          100.0 * mtp_accepted as f64 / mtp_drafted as f64);
             }
         }
 

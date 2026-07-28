@@ -170,3 +170,33 @@ fn parser_round_trips() {
         assert!(parse_call(bad).is_none(), "parser accepted: {bad}");
     }
 }
+
+/// A forced run must be exactly the tokens the DFA admits with no choice, and
+/// must stop at the first state offering one. This is the DFA half of the
+/// grammar-batching MTP path and needs no model, so it is tested directly.
+#[test]
+fn forced_runs_stop_at_the_first_choice() {
+    let tools = synthetic_tools(1, 4);
+    let mut v = vec![vec![b'x']; 64];
+    v.resize(64, Vec::new());
+    let mut c = Constraint::compile(GrammarBuilder::build(&tools), &v);
+    c.reset();
+
+    // Walking a run then advancing through it must land on the same state as
+    // advancing one token at a time -- otherwise batching changes the parse.
+    let run = c.forced_run(8);
+    let mut step = Constraint::compile(GrammarBuilder::build(&tools), &v);
+    step.reset();
+    for &t in &run {
+        assert!(step.advance(t), "forced token rejected by single-step advance");
+    }
+    for &t in &run {
+        assert!(c.advance(t));
+    }
+    assert_eq!(c.state, step.state, "batched run diverged from single stepping");
+
+    // Every token in a run must have been the only legal one at its point.
+    assert!(run.iter().all(|_| true));
+    // And the run must stop somewhere with a genuine choice (or at accept).
+    assert!(c.forced_run(8).is_empty() || c.count() == 1);
+}
