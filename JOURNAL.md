@@ -1124,3 +1124,45 @@ entirely on whichever goes last.
 is no result.** Every A/B in this project before this section was one sample per
 arm. The ones that survive do so because they are large, not because the method
 was sound.
+
+
+---
+
+## 17. The behavioural gate, finally run
+
+Everything above this section was speed work validated only against
+kernel-level error ratios. The gate that decides whether the engine still
+*works* had never been executed. It has now.
+
+25 requests against 12 tools x 4 parameters, prompts built in Gemma 4's real
+declaration format (1628 tokens each), scored on whether the engine picks the
+right tool and fills the right arguments.
+
+| metric | unconstrained | grammar-constrained |
+|---|---|---|
+| well-formed call | 25/25 | 25/25 |
+| correct tool | 25/25 | 25/25 |
+| all arguments right | 25/25 | 25/25 |
+| argument-level | 100/100 | 100/100 |
+
+That is the whole accumulated approximation stack passing at once: int4
+group-256 weights, int8 activations, int8 query quantisation, 16-bit softmax
+weights, Hadamard rotation, and an attention kernel rewritten twice.
+
+**The constraint contributes no measurable accuracy here.** Unconstrained
+already scores 100%, so the grammar's value is a worst-case structural
+guarantee rather than an average-case gain — plus 275 of 940 decode steps
+(29%) whose LM-head read is skipped outright, which is a *speed* win. Saying
+the constraint is what delivers exactness would be backwards on this evidence.
+What it buys is that the 26th request cannot emit something unparseable, which
+is a different and still worthwhile property.
+
+**And 25/25 is a floor, not a precision instrument.** A regression to 95%
+accuracy would still show 25/25 about 28% of the time (0.95^25 = 0.28). This
+gate detects breakage, not drift. Its job starts now: any drop from 100% on a
+future change is signal, and that is exactly what it is for when AMX attention
+or sparsity lands.
+
+**Trap 15 — a gate everything passes tells you nothing until something fails.**
+Worth stating because the temptation after a 100% result is to treat it as
+proof of quality rather than as the absence of catastrophe. It is the second.
