@@ -21,11 +21,14 @@ no GPU. **Target workload:** 8 concurrent requests, ~8k prompt in, ~2k out,
 | KV sharing + sliding-window KV | **done** | 32 MB/seq at 8k vs ~1.8 GB naive for 8 seqs |
 | Batched decode (shared GEMM across seqs) | **done** | `forward_multi` |
 | Persistent worker pool | **done** | GEMM split on N, attention on (token, head) |
-| K-blocking for L1-resident AMX operands | **open** | biggest known kernel win, see Kernel §4 |
+| Flash-tiled attention + AMX-INT8 Q·Kᵀ | **open** | biggest *prefill* win: 42% collapse 128→8192 is attention |
+| Multithread the GEMM preamble (FWHT/quant/pack) | **open** | ~half of "ffn_gemm" time is not GEMM; ~20-30% of prefill |
+| K-blocking for L1-resident AMX operands | **open** | GEMM 3.7 of ~11.8 achievable TOPS |
+| BF16 attention | **rejected** | KV is already int8 — bf16 *doubles* KV bandwidth, and AMX-BF16 is half AMX-INT8 (7.0 vs 14.69 TOPS). Only P·V is a genuine candidate |
 | Dual-format weights (int8 prefill / int4 decode) | **open** | prefill is compute-bound, decode DRAM-bound |
 | Prefix radix cache (shared tool definitions) | **open** | 12 tools × 4 params is identical across the 8 requests |
 | Chunked prefill + decode piggyback | **open** | amortise weight reads across both phases |
-| Grammar-constrained tool decoding | **open** | the exactness half of the brief |
+| Grammar-constrained tool decoding | **done** | 1011-state DFA, 33 MB mask, 36% of steps forced |
 | Activation-sparsity skipping | **n/a** | Gemma 3n had 95% sparsity; **Gemma 4 does not** |
 | AMX tile-state guard (platform defect) | **done** | sentinel-biased accumulator + per-block retry, 1-2% cost |
 | **Speculative multi-token prediction (MTP)** | **queued — after base perf** | https://ai.google.dev/gemma/docs/mtp/overview — explore an MTP drafter *only once base throughput is squeezed out*, per the brief. Decode here is DRAM-bound at batch 8, which is exactly the regime where speculation pays: extra tokens per weight read are ~free. Open questions: does Gemma 4 ship MTP heads for E2B/E4B, or do we train/distil a drafter? How does the accept rate interact with grammar constraints (a rejected draft inside a JSON tool call is cheap to re-mask, so acceptance may be *higher* under constraints)? |
@@ -564,6 +567,106 @@ beats llama.cpp on decode by 13%. It does not beat it on single-stream, and
 loses on long prefill.** The remaining levers (K-blocking for L1-resident AMX
 operands, flash-style attention, the still-single-threaded GEMM preamble) all
 point the same way, and none of them are exhausted.
+
+---
+
+## 10. Is bit-determinism even the right goal? (challenged, and it held)
+
+Fair challenge raised: torch isn't deterministic, flash-attention isn't
+deterministic, and reduction-order differences producing different-but-correct
+results are completely normal in ML. So is chasing determinism costing us
+performance for a non-bug?
+
+**The general point is right, and I measured it myself**: HF at 4 threads
+disagreed with itself on 13.6% of token positions (max logit diff 10.7). That is
+exactly the normal phenomenon, and I nearly published it as a noise floor.
+
+**But "bit-identical?" is the wrong test.** The right one is *"is this delta
+explainable by floating-point reduction order?"* Three independent reasons it
+was not, here:
+
+1. **The AMX accumulator is int32.** Integer addition is associative and exact —
+   `a+b+c` is order-independent. A varying int32 dot product has no legitimate
+   explanation.
+2. **Magnitude is ~4 orders too large.** fp32 reduction-order effects on a
+   K=1536 dot land near 1e-4 relative. Observed: absolute logit deltas of 1–7
+   against a median top1–top2 gap of 3.79 — large enough to change the emitted
+   token. Rounding noise does not change which token you emit.
+3. **The minimal repro contains no arithmetic at all.** Store a byte pattern in a
+   tile, wait, read it back, bytes differ. No FMA, no reduction, no order.
+
+So: data loss, not numerical noise.
+
+**Determinism here is free, not purchased.** fastgemma is deterministic *by
+construction* — int32 accumulation, threads own disjoint output columns (no
+cross-thread reduction anywhere), fixed loop order. That is precisely why it made
+such a sensitive bug detector. If buying determinism ever costs throughput —
+forcing reduction order, disabling split-k, serialising accumulation — it goes.
+
+**Process lesson:** ask "is this near fp32 epsilon?" *first*. One minute of that
+would have ruled out normal ML noise immediately and pointed at corruption,
+instead of an hour spent hunting uninitialised buffers.
+
+---
+
+## 11. Prefill and decode are different problems (concurrency-1 curves)
+
+Full target-range curve, single sequence, group 256, guard on:
+
+| prefill tokens | tok/s | | decode from 8192 ctx | tok/s | ms/step |
+|---|---|---|---|---|---|
+| 128 | 156.0 | | 128 out | 13.1 | 76.5 |
+| 256 | 166.8 | | 256 out | 13.0 | 77.1 |
+| 512 | 149.8 | | 512 out | 13.1 | 76.3 |
+| 1024 | 147.2 | | 1024 out | 12.9 | 77.3 |
+| 2048 | 135.4 | | 2048 out | 12.7 | 78.5 |
+| 4096 | 112.9 | | | | |
+| 8192 | **90.5** | | | | |
+
+Two things fall out, and they point in opposite directions:
+
+- **Prefill collapses 42%** from 128 → 8192. That is the O(M²) attention kernel,
+  not the GEMM.
+- **Decode is flat** — 13.1 → 12.7 tok/s with context growing to 10k. The
+  sliding-window + KV-sharing design means decode barely notices context length.
+  Attention is *not* the decode bottleneck; the weight read is.
+
+So the optimisation queue is really **two queues**:
+
+**Prefill** (TTFT): flash-style tiling → AMX-INT8 for Q·Kᵀ → multithread the
+GEMM preamble → K-blocking for L1 residency.
+
+**Decode** (output throughput): none of the above move it. The levers are the
+grammar-forced LM-head skip (36% of tool-call steps need no LM-head read at
+all), int4 on attention projections, and then MTP.
+
+### Why INT8 and not BF16 for attention
+
+Proposed: bf16 attention to save bandwidth, flash-style over bf16. Both halves
+need correcting.
+
+- **Bandwidth: bf16 is a regression.** KV is already int8 (40 MB/seq at 10k);
+  bf16 doubles it to 80 MB. That spends bandwidth rather than saving it.
+- **Compute: INT8 is 2× BF16 on this box** — 14.69 TOPS vs 7.00 TFLOPS — and the
+  operands are *already* int8. K sits in cache as int8, and Q is cheap to
+  quantise because `q_norm` bounds its range before RoPE by construction. Going
+  bf16 would mean converting int8 → bf16 to run at half rate.
+- **Flash tiling is orthogonal to dtype.** Its win is L1 residency (67 cyc/k-step
+  vs 332 from L3) plus online softmax avoiding the full attention matrix. Do it
+  regardless.
+
+The one genuine bf16 candidate is **P·V**: softmax probabilities live in [0,1]
+with a long tail and quantise to int8 badly. Either keep the AVX-512 weighted sum
+over int8 V, or use AMX-BF16 there. Worth benchmarking; it is the smaller half.
+
+### "Multithread the GEMM" — right problem, wrong name
+
+The GEMM has been multithreaded since the pool landed (split along N, disjoint
+output columns). What is still single-threaded is the per-GEMM **preamble**:
+FWHT rotation, activation quantisation, A tile-packing. That is why a standalone
+GEMM bench shows ~2 TOPS while the same shape inside the forward pass delivers
+~0.5 — roughly half of "ffn_gemm" time is not GEMM. Worth ~20–30% of prefill and
+far easier than K-blocking.
 
 ---
 
