@@ -21,12 +21,13 @@ no GPU. **Target workload:** 8 concurrent requests, ~8k prompt in, ~2k out,
 | KV sharing + sliding-window KV | **done** | 32 MB/seq at 8k vs ~1.8 GB naive for 8 seqs |
 | Batched decode (shared GEMM across seqs) | **done** | `forward_multi` |
 | Persistent worker pool | **done** | GEMM split on N, attention on (token, head) |
-| Flash-tiled attention | **rejected (measured)** | −7 to −12% at every context we serve; K/V is already L2-resident with 1 KV head. Kept behind `FGM_BLOCKED_ATTN=1` for E4B / longer context. §12 |
-| AMX-INT8 Q·Kᵀ | **open** | separate from blocking; the dot products themselves are still AVX-512 |
+| Flash-tiled attention | **rejected and deleted** | loses at *every* shape 128→8192 (−1.3% to −17.3%). §12 |
+| VNNI-INT8 Q·Kᵀ and P·V | **done** | +34.6% prefill at 8192; attention 61.9% → 46.2% of prefill. §14 |
+| AMX-INT8 attention | **open** | VNNI ≈ 580 G MAC/s ceiling vs AMX's 7.35 T; needs K in tile layout too (V already is) |
 | Multithread the GEMM preamble (FWHT/quant/pack) | **done** | measured +25% at 2k, +20% at 4k, +9% at 8k prefill; bit-exact |
 | K-blocking for L1-resident AMX operands | **open** | GEMM 3.7 of ~11.8 achievable TOPS |
 | BF16 attention | **rejected** | KV is already int8 — bf16 *doubles* KV bandwidth, and AMX-BF16 is half AMX-INT8 (7.0 vs 14.69 TOPS). Only P·V is a genuine candidate |
-| Dual-format weights (int8 prefill / int4 decode) | **built, measuring** | converter `--weights=both` (+1.56 GB: an int8 twin is 2× the int4 bytes), runtime `FGM_WEIGHTS=int4\|int8\|auto:M` |
+| Dual-format weights (int8 prefill / int4 decode) | **done, measured** | int8 +10–14% prefill, int4 +0–6% decode — the split the design predicted. §14 |
 | Prefix sharing (shared tool definitions) | **in progress** | `KvCache::fork_from`; 12 tools × 4 params is identical across the 8 requests |
 | Chunked prefill + decode piggyback | **open** | amortise weight reads across both phases |
 | Grammar-constrained tool decoding | **done (rewritten)** | Gemma 4 *native* call syntax, not JSON: 518-state DFA, 17 MB mask, 42% of steps forced. The JSON version could reach only 1 of 12 tools. §7 |
@@ -880,3 +881,169 @@ something else scales with context. **Profile first.** Picking an exotic
 attention before knowing which of those is true would be the same mistake as the
 1924 GB estimate in §12 — a number that is arithmetically correct and about the
 wrong machine.
+
+---
+
+## 14. Attention was the whole problem, and the estimate said otherwise
+
+### The profile that redirected the work
+
+Measured per shape, concurrency 1, g256, idle box — attention as a share of
+prefill:
+
+| ctx | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 |
+|---|---|---|---|---|---|---|---|
+| attention | 5.1% | 17.4% | 24.4% | 30.6% | 38.3% | 49.3% | **61.9%** |
+
+Non-attention time per token is **flat at 3.6–3.7 ms** across that entire
+range. The whole 188 → 104 tok/s collapse was attention and nothing else.
+
+My first-principles MAC count had put attention at ~11% at 8192. It was off by
+6×, and in the direction that would have caused real damage: I was about to
+build block-sparse attention to reduce the *number* of positions, when the
+actual problem was that the kernel processed each position at **49.6 G MAC/s —
+18.5% of this box's f32 FMA peak**. Sparsity multiplies whatever the per-position
+cost is; it does not fix it. Fixing the constant first was worth more and was
+much less work.
+
+Where the 81.5% went was visible once the share was known: per 16 elements the
+dot product did `load + cvtepi8_epi32 + cvtepi32_ps + fmadd`. **Three of every
+four issue slots were format conversion, on operands that were already int8 in
+cache.**
+
+### Q·Kᵀ in int8 (VNNI)
+
+`vpdpbusd` does 64 MACs per instruction but wants (u8, i8). K is biased into u8
+with `XOR 0x80` — on a two's-complement byte that is exactly +128 — and
+corrected with
+
+    sum_i (k_i + 128) q_i  =  sum_i k_i q_i  +  128 * sum_i q_i
+
+where `sum_i q_i` is one scalar per (row, head), computed while quantising q.
+**Biasing K rather than Q is what keeps this free of any KV-cache change**: no
+stored per-position row sums, no second layout. Four positions per iteration
+against four accumulators, combined with an unpack/hadd tree (~13 ops) rather
+than four `_mm512_reduce_add_epi32` (~28) — without that the reduction would
+have dominated a dot product that VNNI had just made eight times cheaper.
+
+### P·V in int8, which needed a layout change
+
+`out[j] = sum_t w_t v_t[j]` is a scaled accumulate, not a dot product, so it
+cannot use an integer dot-product instruction while V is `[position][dim]`. V is
+now stored transposed with 4-way interleave:
+
+    v[((slot/4) * row_len + j) * 4 + (slot%4)]
+
+so the four bytes `vpdpbusd` multiplies and adds inside each 32-bit lane are
+four consecutive positions of one dim — the reduction over positions falls out
+of the instruction. That is the VNNI/AMX B-tile layout. Writing costs a stride-4
+scatter once per position per layer; reading is what prefill does O(context)
+times, so this is the right side to make awkward.
+
+| prefill tok/s | start | +Q·Kᵀ | +P·V | total |
+|---|---|---|---|---|
+| 1024 | 185.4 | 195.2 | **219.7** | +18.5% |
+| 2048 | 169.6 | 184.0 | **207.7** | +22.5% |
+| 4096 | 140.9 | 159.3 | **176.9** | +25.5% |
+| 8192 | 104.2 | 124.9 | **140.3** | +34.6% |
+
+Attention share at 8192: 61.9% → 53.4% → **46.2%**. `ffn_gemm` is now the
+largest single cost at every context up to 4096.
+
+### The acceptance bar earning its keep
+
+Quantising anything in attention is an approximation, so the question is not
+whether the kernel matches a float reference — it cannot, the KV cache is int8
+by design — but **how much error it adds on top of the error the design already
+accepts**. `bench/kernels/attn_test.c` measures exactly that ratio against an
+exact double-precision reference, sweeping query magnitude because score error
+is amplified through `exp()` and an error that is harmless on flat attention is
+not harmless on sharp attention.
+
+int8 query: **1.21–1.74×** the int8-cache error. Fine.
+
+u8 softmax weights: **2.90×**, and worst on *flat* attention — precisely the
+long-context regime this work exists to speed up. Before assuming quantisation,
+I checked it was not a bug: a double-precision model of exactly what the kernel
+claims to do matched it to **3.4e-08**. So the error was real. Fixed by
+splitting the weight across two u8 passes for 16-bit resolution, reusing the
+same loaded V vector — two extra `dpbusd` and one extra accumulator per 16 dims,
+not a second pass over memory. Ratio returns to 1.21–1.74×.
+
+**Trap 12 — an error number without a baseline is not a measurement.** The first
+reading of the int8-query error was "13.8%", taken against an int8-K reference.
+That isolates the query's contribution while hiding that K's contribution is the
+same order, and it nearly bought a slower int16 path for no reason. The harness
+now reports the ratio, so that framing is not available.
+
+### Blocked attention, finished and deleted
+
+The short-context end, which was the one open question:
+
+| ctx | 128 | 256 | 512 | 1024 |
+|---|---|---|---|---|
+| blocked | 186.8 | 201.6 | 189.4 | 159.5 |
+| per-head | **189.3** | **218.5** | **203.4** | **192.9** |
+
+It loses at every shape from 128 to 8192. At 128 the paths are within 1.3% for
+an uninteresting reason — attention is 5.1% of prefill there, so neither can
+matter. Deleted rather than carried: P·V needed the V transpose, and carrying a
+second V reader through that is real complexity for a path that never wins.
+
+---
+
+## 15. Dual-format weights: the predicted split, measured
+
+`--weights=both` stores an int8 twin of every int4 layer GEMM at `<name>.i8`
+(+1.56 GB — an int8 twin is *twice* the int4 bytes, not the same; I had this
+at +778 MB and was wrong). `FGM_WEIGHTS=int4|int8|auto:M`, default `auto:16`.
+
+Prefill, tok/s:
+
+| shape | int4 | int8 | int8 gain |
+|---|---|---|---|
+| c=1, 1024 | 226.2 | **255.2** | +12.8% |
+| c=1, 8192 | 141.5 | **160.7** | +13.6% |
+| c=8, 1024 | 224.9 | **257.1** | +14.3% |
+| c=8, 8192 | 147.7 | **162.4** | +10.0% |
+
+Decode, tok/s:
+
+| shape | int4 | int8 | int4 gain |
+|---|---|---|---|
+| c=1, 1024 | **13.5** | 13.4 | +0.7% |
+| c=1, 8192 | **13.3** | 12.5 | +6.4% |
+| c=8, 1024 | **67.8** | 67.6 | +0.3% |
+| c=8, 8192 | **49.4** | 46.7 | +5.8% |
+
+Exactly the split the design predicted, for the reason it predicted: a prefill
+GEMM shares one weight read across hundreds of rows and is compute-bound, where
+int4's per-group accumulator drain binds; a decode GEMM reads the weight for one
+row per sequence and is DRAM-bound, where int4's halved bytes win. The `auto:16`
+threshold is the AMX tile height — below it a GEMM cannot fill one tile of rows,
+so it is decode-shaped whatever the caller calls it. Batched decode at
+concurrency 8 has m=8, lands on int4, and int4 is indeed faster there.
+
+### Trap 13 — loadavg cannot see a competitor that just started
+
+The first run of this comparison was contaminated and I nearly published it. An
+orphaned bench from a script killed by a tool timeout overlapped one arm:
+
+| int4, c=1 | contaminated | clean |
+|---|---|---|
+| 1024 | 99.6 | **208.1** |
+| 8192 | 84.9 | **149.6** |
+
+2× low, on one side of a comparison only — the worst possible shape for an
+error, because it looks like a result. The loadavg guard passed it because
+**loadavg is a one-minute decaying average: a four-thread process one second old
+barely moves it.** The guard now scans `/proc/<pid>/comm` for sibling benches
+directly and refuses, and re-checks *after* the run — contention that starts
+mid-run is invisible to any check made before it. The post-run warning prints to
+stdout so it lands in the same log as the numbers it invalidates.
+
+Matched on `comm`, not the command line, deliberately: a command-line match also
+hits any watcher whose arguments mention the process it waits for. That is the
+inverse bug, and it had already cost twenty minutes — `pgrep -f convert_gemma4`
+matched the waiting loop's own command line, so a finished conversion was
+reported as still running until I checked the log instead of the process table.
