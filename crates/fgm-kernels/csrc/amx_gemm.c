@@ -96,24 +96,8 @@ static inline void unpack_tile(const uint8_t *src, int8_t *dst) {
   __asm__ __volatile__("" : : "r"(dst) : "memory");
 }
 
-// ---------------------------------------------------------------- A packing
-// A tiles must be contiguous. Loading a 16x64 tile straight out of row-major
-// A[M,K] means 16 cache lines K bytes apart (24 KB of stride for K=1536), and
-// the resulting tile-load stalls cost more than the dpbssd they feed — measured
-// at ~5x off peak. Packing A once per GEMM into [m16][kb][16][64] costs O(M*K)
-// against the GEMM's O(M*N*K), and makes every tile load a flat 1 KB read.
-void fgm_pack_a(int M, int K, const int8_t *A, int8_t *Ap) {
-  const int KB = K / 64, MB = (M + 15) / 16;
-  for (int mb = 0; mb < MB; mb++)
-    for (int kb = 0; kb < KB; kb++) {
-      int8_t *d = Ap + ((size_t)mb * KB + kb) * 1024;
-      for (int r = 0; r < 16; r++) {
-        int m = mb * 16 + r;
-        if (m < M) memcpy(d + r * 64, A + (size_t)m * K + kb * 64, 64);
-        else memset(d + r * 64, 0, 64);
-      }
-    }
-}
+// A packing lives in ops.c: it is pure data movement, both GEMM backends need
+// it, and anything compiled into this file is only reachable on an AMX host.
 
 // acc_f32[m][n] += (float)acc_i32[m][n] * bs[n], one 16-wide n block
 static inline void drain16(const int32_t *ai, int mr, float *af, int ldaf,

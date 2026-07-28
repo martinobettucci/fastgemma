@@ -31,6 +31,18 @@ extern "C" {
         b: *const i8, b_scale: *const f32,
         c: *mut f32, ldc: i32, n0: i32, n1: i32,
     );
+    fn fgm_cpu_has_amx() -> i32;
+    fn fgm_cpu_has_avx512_vnni() -> i32;
+    fn fgm_gemm_q4g_vnni(
+        m: i32, n: i32, k: i32, a: *const i8, a_scale: *const f32,
+        bq: *const u8, b_scale: *const f16, group: i32,
+        c: *mut f32, ldc: i32, n0: i32, n1: i32,
+    );
+    fn fgm_gemm_q8c_vnni(
+        m: i32, n: i32, k: i32, a: *const i8, a_scale: *const f32,
+        b: *const i8, b_scale: *const f32,
+        c: *mut f32, ldc: i32, n0: i32, n1: i32,
+    );
 
     fn fgm_rmsnorm(out: *mut f32, x: *const f32, w: *const f32, n: i32, eps: f32);
     fn fgm_rmsnorm_noscale(out: *mut f32, x: *const f32, n: i32, eps: f32);
@@ -69,8 +81,66 @@ extern "C" {
 
 static AMX: Once = Once::new();
 
+/// Which GEMM kernel the process will use.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Backend {
+    /// AMX INT8 tiles — 14.7 TOPS measured ceiling.
+    Amx,
+    /// AVX-512 VNNI — 1.16 TOPS measured ceiling. Same weights, same layout.
+    Vnni,
+}
+
+impl Backend {
+    pub fn name(self) -> &'static str {
+        match self {
+            Backend::Amx => "amx",
+            Backend::Vnni => "avx512-vnni",
+        }
+    }
+}
+
+/// The GEMM backend for this host, decided once and cached.
+///
+/// The decision is made from CPUID, not from whether `fgm_amx_init` succeeded:
+/// the tile-permission syscall is per-thread and returns ENOTSUP on a CPU with
+/// no tile registers, but by the time you learn that you may already have
+/// executed a tile instruction and taken SIGILL. CPUID answers before anything
+/// runs.
+///
+/// `FGM_BACKEND=amx|vnni` forces it, which is the only way to A/B the two
+/// paths on a host that has both.
+pub fn backend() -> Backend {
+    use std::sync::OnceLock;
+    static B: OnceLock<Backend> = OnceLock::new();
+    *B.get_or_init(|| {
+        let has_amx = unsafe { fgm_cpu_has_amx() != 0 };
+        match std::env::var("FGM_BACKEND").as_deref() {
+            Ok("vnni") => Backend::Vnni,
+            Ok("amx") => {
+                assert!(has_amx, "FGM_BACKEND=amx but this CPU has no AMX");
+                Backend::Amx
+            }
+            _ => {
+                if has_amx && amx_init() {
+                    Backend::Amx
+                } else {
+                    assert!(
+                        unsafe { fgm_cpu_has_avx512_vnni() != 0 },
+                        "fastgemma needs AVX-512 VNNI at minimum; this CPU has neither \
+                         that nor AMX"
+                    );
+                    Backend::Vnni
+                }
+            }
+        }
+    })
+}
+
 /// Request XTILEDATA from the kernel. Must be called on every thread that runs
 /// AMX instructions, before the first one — the permission is per-thread.
+///
+/// Returns false on a CPU without AMX (the syscall reports ENOTSUP), which is
+/// not an error: it is how [`backend`] learns to use the VNNI path.
 pub fn amx_init() -> bool {
     let mut ok = true;
     AMX.call_once(|| {});
@@ -106,11 +176,18 @@ pub fn gemm_q4g(
     debug_assert!(k % 64 == 0 && n % 16 == 0);
     debug_assert!((n1 - n0) % 4 == 0, "n-block range must be a multiple of 4");
     unsafe {
-        fgm_gemm_q4g(
-            m as i32, n as i32, k as i32, a.as_ptr(), a_scale.as_ptr(),
-            bq.as_ptr(), b_scale.as_ptr(), group as i32,
-            c.as_mut_ptr(), ldc as i32, n0 as i32, n1 as i32,
-        )
+        match backend() {
+            Backend::Amx => fgm_gemm_q4g(
+                m as i32, n as i32, k as i32, a.as_ptr(), a_scale.as_ptr(),
+                bq.as_ptr(), b_scale.as_ptr(), group as i32,
+                c.as_mut_ptr(), ldc as i32, n0 as i32, n1 as i32,
+            ),
+            Backend::Vnni => fgm_gemm_q4g_vnni(
+                m as i32, n as i32, k as i32, a.as_ptr(), a_scale.as_ptr(),
+                bq.as_ptr(), b_scale.as_ptr(), group as i32,
+                c.as_mut_ptr(), ldc as i32, n0 as i32, n1 as i32,
+            ),
+        }
     }
 }
 
@@ -124,11 +201,18 @@ pub fn gemm_q8c(
     debug_assert!(k % 64 == 0 && n % 16 == 0);
     debug_assert!((n1 - n0) % 4 == 0, "n-block range must be a multiple of 4");
     unsafe {
-        fgm_gemm_q8c(
-            m as i32, n as i32, k as i32, a.as_ptr(), a_scale.as_ptr(),
-            b.as_ptr(), b_scale.as_ptr(), c.as_mut_ptr(), ldc as i32,
-            n0 as i32, n1 as i32,
-        )
+        match backend() {
+            Backend::Amx => fgm_gemm_q8c(
+                m as i32, n as i32, k as i32, a.as_ptr(), a_scale.as_ptr(),
+                b.as_ptr(), b_scale.as_ptr(), c.as_mut_ptr(), ldc as i32,
+                n0 as i32, n1 as i32,
+            ),
+            Backend::Vnni => fgm_gemm_q8c_vnni(
+                m as i32, n as i32, k as i32, a.as_ptr(), a_scale.as_ptr(),
+                b.as_ptr(), b_scale.as_ptr(), c.as_mut_ptr(), ldc as i32,
+                n0 as i32, n1 as i32,
+            ),
+        }
     }
 }
 
@@ -360,6 +444,11 @@ pub fn tile_retries_reset() {
 ///
 /// Returns (guard_enabled, corrupted_trials, hold_us_that_found_it).
 pub fn tile_guard_autodetect(trials: usize) -> (bool, usize, i64) {
+    // The probe itself is AMX code. On a VNNI host there is no tile state to
+    // lose and running the probe to find that out would be the SIGILL.
+    if backend() != Backend::Amx {
+        return (false, 0, 0);
+    }
     match std::env::var("FGM_TILE_GUARD").as_deref() {
         Ok("on") => {
             tile_guard_set(true);

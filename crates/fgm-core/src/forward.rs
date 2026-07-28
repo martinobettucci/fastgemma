@@ -241,8 +241,12 @@ impl<'m> Runner<'m> {
         model: &'m Model, max_tokens: usize, max_ctx: usize, threads: usize,
         max_logit_rows: usize,
     ) -> Self {
-        assert!(k::amx_init(), "AMX XTILEDATA permission denied");
+        // Pick the GEMM backend before anything can execute a tile instruction.
+        // On an AMX host this also grabs XTILEDATA for the calling thread.
+        let backend = k::backend();
+        eprintln!("fastgemma: GEMM backend {}", backend.name());
         // Warm-up: only pay for the corruption guard on platforms that need it.
+        // (No-op on the VNNI path — there is no tile state to lose.)
         let (guard, bad, hold) = k::tile_guard_autodetect(12);
         if guard && hold > 0 {
             eprintln!(
@@ -250,7 +254,7 @@ impl<'m> Runner<'m> {
                  ({bad}/12 trials corrupted at {}us hold) -- guard ENABLED (~1-2%)",
                 hold
             );
-        } else if !guard {
+        } else if !guard && backend == k::Backend::Amx {
             eprintln!("fastgemma: AMX tile state verified across preemption -- guard disabled");
         }
         let cfg = model.cfg.clone();

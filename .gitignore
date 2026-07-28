@@ -75,6 +75,8 @@ bench/kernels/gemm_bench
 bench/kernels/attn_test
 bench/kernels/attn_bench
 bench/kernels/dbg
+bench/kernels/qk_bench
+bench/kernels/vnni_test
 
 # eval scratch: token-id files the harness regenerates on every run
 bench/eval/.prompts.txt

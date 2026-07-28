@@ -218,10 +218,17 @@ void fgm_gather_q8r(float *out, const int8_t *tbl, const float *sc, int row, int
 
 // int4 row-major table, group 64, canonical half-split nibbles.
 // scales are [rows, k/64] f16.
-void fgm_gather_q4r(float *out, const uint8_t *tbl, const _Float16 *sc, int row, int k) {
+//
+// The scale is taken as a raw u16 and widened with `_cvtsh_ss` (F16C) rather
+// than declared `_Float16`. With `-march=sapphirerapids` GCC lowers a
+// `_Float16` load to `vcvtsh2ss`, an AVX512-FP16 instruction, and this one
+// line was the only thing in ops.c that would not run on an AVX-512 host
+// without FP16 -- the whole file SIGILL'd here and nowhere else. F16C widening
+// is exact for every half value, so the result is bit-identical.
+void fgm_gather_q4r(float *out, const uint8_t *tbl, const uint16_t *sc, int row, int k) {
   const int g = k / 64;
   const uint8_t *p = tbl + (size_t)row * (k / 2);
-  const _Float16 *rs = sc + (size_t)row * g;
+  const uint16_t *rs = sc + (size_t)row * g;
   const __m256i m4 = _mm256_set1_epi8(0x0F), k8 = _mm256_set1_epi8(8);
   for (int b = 0; b < g; b++) {
     __m256i packed = _mm256_loadu_si256((const __m256i *)(p + b * 32));
@@ -229,7 +236,7 @@ void fgm_gather_q4r(float *out, const uint8_t *tbl, const _Float16 *sc, int row,
     __m256i hi = _mm256_and_si256(_mm256_srli_epi16(packed, 4), m4);
     lo = _mm256_sub_epi8(_mm256_xor_si256(lo, k8), k8);
     hi = _mm256_sub_epi8(_mm256_xor_si256(hi, k8), k8);
-    __m512 s = _mm512_set1_ps((float)rs[b]);
+    __m512 s = _mm512_set1_ps(_cvtsh_ss(rs[b]));
     float *o = out + b * 64;
     _Alignas(32) int8_t tmp[64];
     _mm256_storeu_si256((__m256i *)tmp, lo);
@@ -258,6 +265,30 @@ void fgm_gather_q4r(float *out, const uint8_t *tbl, const _Float16 *sc, int row,
 //   qs   [m]      f32   per-row scales
 //   pa            i8    tile-packed output for the AMX kernel
 //
+// ---------------------------------------------------------------- A packing
+// A tiles must be contiguous. Loading a 16x64 tile straight out of row-major
+// A[M,K] means 16 cache lines K bytes apart (24 KB of stride for K=1536), and
+// the resulting tile-load stalls cost more than the dpbssd they feed -- measured
+// at ~5x off peak. Packing A once per GEMM into [m16][kb][16][64] costs O(M*K)
+// against the GEMM's O(M*N*K), and makes every tile load a flat 1 KB read.
+//
+// The VNNI backend reads the same packed bytes: within a tile, row rr's four
+// bytes for k = kb*64 + r*4 are contiguous at rr*64 + r*4, which is exactly the
+// dword vpdpbusd broadcasts. So this stays a single shared layout, and it lives
+// here rather than in amx_gemm.c because a VNNI-only host must be able to run it.
+void fgm_pack_a(int M, int K, const int8_t *A, int8_t *Ap) {
+  const int KB = K / 64, MB = (M + 15) / 16;
+  for (int mb = 0; mb < MB; mb++)
+    for (int kb = 0; kb < KB; kb++) {
+      int8_t *d = Ap + ((size_t)mb * KB + kb) * 1024;
+      for (int r = 0; r < 16; r++) {
+        int m = mb * 16 + r;
+        if (m < M) memcpy(d + r * 64, A + (size_t)m * K + kb * 64, 64);
+        else memset(d + r * 64, 0, 64);
+      }
+    }
+}
+
 // r0/r1 are row bounds; r0 must be a multiple of 16.
 void fgm_prep_rows(const float *src, int lda, float *rot, int8_t *qa, float *qs,
                    int8_t *pa, int m, int k, int hsz, int r0, int r1) {

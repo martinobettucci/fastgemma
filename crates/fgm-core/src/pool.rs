@@ -237,6 +237,8 @@ impl Pool {
         for tid in 1..nt {
             let inner = inner.clone();
             handles.push(std::thread::spawn(move || {
+                // Per-thread tile permission. Fails harmlessly on a VNNI host,
+                // where nothing this thread runs touches a tile register.
                 k::amx_init();
                 let mut scratch = vec![0.0f32; scratch_len];
                 loop {
