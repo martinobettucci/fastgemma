@@ -1390,3 +1390,72 @@ was about tok/s, and TTFT is not tok/s.
 Decode at 46.8 tok/s aggregate against 67.3 measured at 512 context earlier is
 the cost of an 8-10k KV set: attention grows with context while the weight read
 does not, so the batching win erodes as the context lengthens.
+
+
+---
+
+## 22. int4 group 512: the gate bites, and the constraint earns its keep
+
+Group 512 halves the number of int32 accumulator drains the int4 kernel must
+perform, at the cost of coarser scales. Converted: 2.77 GB, weight rel err
+**0.1054** against g256's 0.1015 (+3.9%).
+
+### Speed
+
+Alternating the two models across three passes (Trap 18 — this box's AMX
+corruption drift swamps effects of this size when arms are compared across
+separate runs). 8192-token prefill:
+
+| pass | g256 ttft | g512 ttft |
+|---|---|---|
+| 1 | 225.43 s (cold page cache) | 51.40 s |
+| 2 | 53.69 s | 50.11 s |
+| 3 | 54.17 s | 49.49 s |
+| warm median | 53.9 s = 151.9 tok/s | **50.1 s = 163.5 tok/s** |
+
+**+7.6% prefill**, decode unchanged at 13.3 tok/s. Not the +38% the standalone
+GEMM benchmark predicted, and the reason is the same dilution as always:
+`ffn_gemm` is ~40% of prefill at 8192, so a GEMM-local gain arrives at the
+model divided by its share.
+
+### The gate rejects it — the first time it has rejected anything
+
+Unconstrained tool calling on g512: **24/25**. Retention held at 7/7, isolating
+the regression to tool selection rather than context handling. The failing case:
+
+    want: search_flights{origin: LHR, destination: JFK,
+                         depart_date: 2026-08-03, passengers: 1}
+    got:  "What is the IATA code for the destination airport (JFK) and the
+           number of passengers? Also, what is the year for the departure date?"
+
+The model declined to call the tool and asked a clarifying question instead.
+
+This retroactively validates §17's own caveat. I wrote there that "a gate
+everything passes tells you nothing until something fails" and that its job
+would start when something did. Something did, on the first optimisation
+submitted to it afterwards.
+
+### And the constraint rescues it — overturning a claim I made two sections ago
+
+Constrained tool calling on g512: **25/25, 100/100 argument-level.**
+
+In §17 I wrote that the grammar constraint "contributes no measurable accuracy"
+because unconstrained already scored 100%, and that its value was purely a
+worst-case structural guarantee. That was true *for g256*, and I generalised it
+one model too far. The g512 failure is exactly the worst case the constraint
+exists for: the model emitting no call at all. Constraining forces one at that
+position, and the arguments it then fills are correct.
+
+**So the constraint is what makes the faster weights viable.** Correct
+statement: on a model that does not need rescuing, the constraint buys only
+structure and the 29% LM-head skip; on a model that does, it buys accuracy
+outright. "No measurable benefit" was a measurement on one model, not a
+property of constrained decoding.
+
+### Verdict
+
+g512 ships **conditionally**: +7.6% prefill, free *when tool calls are
+grammar-constrained*, which the target profile always is (12 tools × 4 params
+per request). Unconstrained serving keeps g256, because against a brief that
+weights tool-call exactness equally with speed, 7.6% on one phase does not buy
+a lost tool call.
