@@ -1163,6 +1163,28 @@ gate detects breakage, not drift. Its job starts now: any drop from 100% on a
 future change is signal, and that is exactly what it is for when AMX attention
 or sparsity lands.
 
+### Long-context retention at 8192
+
+A fact planted at seven depths in an 8184-token context, then asked for at the
+end. Depth is swept because the failure modes are positional: a ring bug loses
+the oldest positions, a sliding-window bug loses everything outside the last
+window, a chunk-boundary bug loses whatever landed on a multiple of the prefill
+chunk.
+
+| depth | 0.02 | 0.15 | 0.35 | 0.50 | 0.65 | 0.85 | 0.98 |
+|---|---|---|---|---|---|---|---|
+| recalled | yes | yes | yes | yes | yes | yes | yes |
+
+**7/7**, each answering with the exact planted code and nothing else. The 0.02
+and 0.98 ends matter most: those are the ring-buffer wrap and the
+just-before-the-question positions, the two places the KV bugs of §6b actually
+lived.
+
+This is also the measurement that would have killed StreamingLLM-style sink
+attention and H2O eviction had they been built — both discard the middle of the
+context, and depths 0.35–0.65 are exactly the middle. §13 predicted that; this
+is the instrument that would have enforced it.
+
 **Trap 15 — a gate everything passes tells you nothing until something fails.**
 Worth stating because the temptation after a 100% result is to treat it as
 proof of quality rather than as the absence of catastrophe. It is the second.
