@@ -53,8 +53,8 @@ Read off the checkpoint, not the model card:
   checkpoint ships them but `transformers` lists them in
   `_keys_to_ignore_on_load_unexpected`. We drop them.
 - Those same 20 layers get a **double-wide MLP** (12288 vs 6144).
-- Only layers 0–14 store KV, and only 4 of those need full length. At 8k context
-  that is **~32 MB/seq — 258 MB for all 8 concurrent requests**, where a naive
+- Only layers 0–14 store KV, and only 4 of those need full length. Measured at
+  10k context: **40 MB/seq, 320 MB for all 8 concurrent requests**, where a naive
   all-layers-full-length engine would need ~1.8 GB.
 - Per-Layer Embeddings are a 262144 × 8960 lookup table — 2.35 B parameters,
   *larger than the entire compute network* (1.86 B), but pure gather.
@@ -77,11 +77,19 @@ bench/kernels/             GEMM correctness + throughput sweeps
 
 | tensor class | format | why |
 |---|---|---|
-| FFN gate/up/down | int4, group 64 | 84% of compute params; decode is DRAM-bound |
+| FFN gate/up/down | int4, group 256 | 84% of compute params; decode is DRAM-bound |
 | attention q/k/v/o | int8 per-channel | small, and accuracy-critical |
-| embed / LM head | int4 group 64 | 403 M params |
-| PLE table | int4 group 64 | 2.35 B params, pure gather, mmap-friendly |
+| embed / LM head | int4, group 256 | 403 M params |
+| PLE table | int4, group 64 | 2.35 B params, pure gather; no AMX drain so 64 is free |
 | norms, scalars | f32 | negligible |
+
+Group size is a measured dial, not a guess — it sets how often the int4 kernel
+must drain its int32 accumulator (`--group`):
+
+| group | weight rel err | prefill 512 | decode |
+|---|---|---|---|
+| 64 | 0.0902 | 101.2 tok/s | 12.7 tok/s |
+| 256 | 0.1016 | **131.9 tok/s** | **14.5 tok/s** |
 
 Every linear weight is **Hadamard-rotated along K** (`rotconv`). H is orthogonal,
 so `W' = W Hᵀ` plus a runtime fast Walsh-Hadamard transform of the activation is
@@ -94,7 +102,8 @@ int4 scales use all 16 levels (Q4_0 convention: the extreme element maps onto �
 refined by a per-group MSE search over shrink factors — conversion-time only, no
 runtime change. Gaussian relative error 0.107 → 0.0906.
 
-E2B converts to **2.83 GB** in 1076 s; measured int4 FFN relative error ≈ 0.090.
+E2B converts to **2.78 GB** in ~1070 s; measured int4 FFN relative error ≈ 0.102
+at group 256, 0.090 at group 64.
 
 ## Kernel notes
 
@@ -130,7 +139,58 @@ gcc -O3 -march=sapphirerapids -mamx-int8 -mamx-tile -mavx512fp16 \
 python3 convert/convert_gemma4.py --src <hf-dir> --out model.fgm
 ```
 
+## Results so far (E2B, 4 threads, int4 group 256)
+
+Prefill, single sequence:
+
+| tokens | tok/s |
+|---|---|
+| 128 | 118.4 |
+| 256 | **142.4** |
+| 512 | 131.9 |
+
+Decode:
+
+| | tok/s |
+|---|---|
+| 1 sequence | 14.5 |
+| 8 concurrent, aggregate | **58.7** (4.05× batching win) |
+
+KV cache at 8 concurrent × 10k context: **320 MB total, 40 MB/seq.**
+
+Accuracy vs `transformers` bf16, deterministic (1-thread) reference, real text:
+
+| metric | value |
+|---|---|
+| greedy agreement | 82.7% |
+| HF's pick in our top-3 | 98.8% |
+| HF's pick in our top-5 | 100.0% |
+| mean cosine | 0.99901 |
+| median top1–top2 gap | 3.79 overall, **1.04 where we disagree** |
+
+Disagreements sit almost entirely on near-ties — the signature of int4 weight
+error, not a structural fault. Layer-by-layer the engine tracks HF at cos > 0.99
+through layer 33.
+
+> The reference **must** be run single-threaded. torch's multithreaded bf16 path
+> is non-deterministic on this model: HF agrees with itself on only 86.4% of
+> positions at 4 threads (max logit diff 10.7) versus 100.0% at 1 thread.
+> Grading against the 4-thread "noise floor" would have flattered this engine by
+> ~15 points.
+
+Constrained tool calling, 12 tools × 4 params on the real 262144-token vocab:
+1011 DFA states, 3.4 s one-time compile, 33.1 MB of mask, output parses with the
+right tool and all args. **36% of decode steps admit exactly one token** — those
+can skip the 201 MB int4 LM-head read entirely.
+
 ## Status
 
-Converter and AMX kernels done and verified. Model forward, serving runtime,
-constrained tool-call decoding, and end-to-end baselines in progress.
+Done and measured: hardware roofline, AMX INT8 kernels, quantizing converter,
+validated Gemma 4 forward pass, worker pool, batched decode, int4 group-size
+A/B, constrained tool-call decoding, accuracy harness.
+
+Not done yet: llama.cpp / ONNX Runtime baselines on this box, E4B conversion,
+prefix radix cache for the shared tool-definition prefix, K-blocking for
+L1-resident AMX operands (the largest known remaining kernel win), and
+speculative multi-token prediction. See `JOURNAL.md` for the running log,
+including the traps that cost the most time.

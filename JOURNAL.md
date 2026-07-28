@@ -138,8 +138,23 @@ O(MR·NR·group) ⇒ group is a direct speed/accuracy knob.
 | 256 | 0.1018 | 2.19 |
 | 512 | 0.1055 | 3.02 |
 
-→ converting a group-256 model for an end-to-end A/B. ~13% more weight error for
-~2.2× GEMM.
+**End-to-end A/B, group 64 vs 256** (clean machine, 4 threads, E2B):
+
+| | g64 | g256 | delta |
+|---|---|---|---|
+| prefill 256 tok | 117.3 tok/s | **142.4** | +21% |
+| prefill 512 tok | 101.2 tok/s | **131.9** | +30% |
+| decode, 1 seq | 12.72 tok/s | **14.47** | +14% |
+| converted size | 2.83 GB | 2.78 GB | — |
+| measured weight rel err | 0.0902 | 0.1016 | +13% |
+
+Group 256 is the better operating point and is now the default recommendation.
+The standalone GEMM bench predicted 2.2×; end-to-end delivers 1.2–1.3× because
+the GEMM is only ~65–75% of prefill and the per-GEMM preamble (FWHT, activation
+quantisation, A packing) is unchanged and still single-threaded.
+
+Note the 64-token row for g256 read 32 tok/s on first run — cold page cache on a
+freshly written 2.78 GB file, not a regression. Re-runs land at ~118 tok/s.
 
 **Shipped E2B config:** FFN int4-g64, attention int8-per-channel, embed/LM-head
 int4, PLE int4, norms f32. 10.2 GB bf16 → **2.83 GB** in 1076 s.
@@ -274,3 +289,47 @@ single-threaded. That is the next target after K-blocking.
 **Benchmarking hygiene note:** one sweep was silently contaminated by a
 background conversion job stealing a core (prefill "dropped" 105 → 85 tok/s).
 Always check for background load before trusting a delta.
+
+### Batching (the point of the whole exercise)
+
+`forward_multi` shares every GEMM across concurrent sequences. Measured at
+8 concurrent, 512 in / 32 out, group 256:
+
+| | tok/s |
+|---|---|
+| decode, 1 sequence | 14.47 |
+| decode, 8 concurrent (aggregate) | **58.7** |
+| per-sequence at batch 8 | 7.3 |
+
+**4.05× aggregate throughput** from batching. Decode is DRAM-bound on the weight
+read, which does not grow with batch size, so this is the expected shape — and
+it is also exactly why MTP speculation should pay here.
+
+---
+
+## 7. Constrained tool calling
+
+DFA over the tool schemas → per-state token bitset. On the real 262144-token
+vocab, 12 tools × 4 params: **1011 states, 3.4 s one-time compile, 33.1 MB of
+mask**, walk accepted in 47 steps emitting
+
+    {"name": "tool_0", "arguments": {"p0": " ", "p1": 1.1, "p2": true, "p3": 1}}
+
+which parses, with the right tool and 4/4 args. Structural validity is a
+guarantee, not a hope.
+
+**36% of steps admit exactly one token.** Those steps can skip the LM head
+entirely — a 201 MB int4 read whose argmax is predetermined. Wiring that up is
+the next decode win for tool-heavy traffic.
+
+**Trap 8 — special tokens have literal byte forms.** `<pad>` decodes to the five
+bytes `<pad>`, which satisfy the JSON string-body class, so the first
+constrained walk emitted `{"p0": "<pad><pad><pad>…` forever *without ever
+violating the grammar*. Added/special tokens are now returned as empty byte
+strings, making them permanently illegal.
+
+**Trap 9 — a weak checker confirms whatever you believe.** The number rule was
+"digits and dots", which accepts `..` and the empty string; the walk emitted
+`"p1": ..` and my bracket-counting "is valid JSON" check passed it. Replaced
+with a real JSON number DFA and a real `serde_json` parse. If the validity check
+is weaker than the property being claimed, it is not evidence.
