@@ -41,7 +41,8 @@ repository. The licence on this repo governs the weights.
 ## What is in the file
 
 `g4e2b-dual.fgm`, 4.34 GB, containing both quantisations of every FFN weight so
-the runtime can choose per GEMM:
+the runtime can choose per GEMM (`tokenizer.json` is the checkpoint's own,
+republished here so a first launch needs one repo rather than a gated one):
 
 | tensor class | format | why |
 |---|---|---|
@@ -282,9 +283,21 @@ LM-head read entirely.
 ```sh
 git clone https://github.com/martinobettucci/fastgemma && cd fastgemma
 cargo build --release
-huggingface-cli download P2Enjoy/fastgemma-gemma-4-E2B g4e2b-dual.fgm --local-dir models/
-./target/release/fgm-bench serve models/g4e2b-dual.fgm
+./target/release/fgm-serve      # fetches the weights below on first launch
 ```
+
+That starts an OpenAI-compatible text-completions server on
+`127.0.0.1:8080`, pulling `g4e2b-dual.fgm` and `tokenizer.json` from this repo
+into `~/.cache/fastgemma`:
+
+```sh
+curl localhost:8080/v1/completions -H 'Content-Type: application/json' \
+  -d '{"prompt": "The capital of France is", "max_tokens": 16}'
+```
+
+Point it at a local file with `--model`, and see the engine's README for the
+CPU compatibility check, the flags, and what the endpoint deliberately does not
+implement (greedy sampling only, no chat endpoint, one request at a time).
 
 `FGM_WEIGHTS=int4|int8|auto:M` selects the quantisation (default `auto:16`, the
 AMX tile height — below 16 rows a GEMM cannot fill one tile of rows, so it is
