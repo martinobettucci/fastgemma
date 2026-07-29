@@ -873,6 +873,7 @@ fn main() {
             let mut ngenerated = 0usize;
             let mut forced_steps = 0usize;
             let (mut mtp_batched, mut mtp_drafted, mut mtp_accepted) = (0usize, 0usize, 0usize);
+            let mut dec_secs = 0.0f64;
             let t_all = Instant::now();
             for toks in &lines {
                 let mut cache = KvCache::new(&cfg, ctx, chunk);
@@ -919,6 +920,12 @@ fn main() {
 
                 let mut out = Vec::with_capacity(ngen);
                 let mut pos = toks.len();
+                // Decode is timed separately from prefill. Every MTP path acts
+                // only on decode, and decode is a quarter of this harness's
+                // wall clock -- an 11% decode win is a 3% total win, which is
+                // inside the noise floor. Timing the whole run would have
+                // measured nothing and reported it as "no effect".
+                let t_dec = Instant::now();
                 while out.len() < ngen {
                     if eos.contains(&tok) { break; }
                     out.push(tok);
@@ -977,37 +984,49 @@ fn main() {
                             let lg = r.forward_multi(&batch, &seq1, &posv, std::slice::from_mut(&mut cache), &rows)
                                 .to_vec();
                             // Verify sequentially. Row i predicts the token that
-                            // should follow batch[i], so row i is the check on
-                            // draft[i].
+                            // follows batch[i], so rows 0..draft.len()-1 check
+                            // draft[0..], and the LAST row is the continuation
+                            // after a fully accepted draft.
+                            //
+                            // That last row is what the first version of this
+                            // block threw away, and it is why a fully accepted
+                            // draft re-emitted its own last token: `next` was
+                            // left holding the token just accepted. Together
+                            // with an out.pop()/out.push(batch[0]) pair that
+                            // deleted an accepted token and duplicated `tok`,
+                            // the path produced 1403 tokens where the exact
+                            // path produced 940 -- and every one of the 25
+                            // outputs differed from baseline. Speculation is
+                            // only worth anything if it is indistinguishable
+                            // from not speculating, so that difference is the
+                            // whole test.
                             let mut acc = 0usize;
-                            let mut next = tok;
-                            for i in 0..draft.len() {
-                                let mut v = lg[i * vsz..(i + 1) * vsz].to_vec();
+                            let mut v = lg[0..vsz].to_vec();
+                            if let Some(c) = con.as_ref() { c.apply(&mut v); }
+                            let mut next = argmax(&v) as u32;
+                            // EOS is never emitted into `out` on the ordinary
+                            // path -- the loop breaks on it first -- so an
+                            // accepted EOS must not be pushed here either.
+                            while acc < draft.len() && next == draft[acc] && !eos.contains(&next) {
+                                out.push(next);
+                                if let Some(c) = con.as_mut() { c.advance(next as usize); }
+                                acc += 1;
+                                let mut v = lg[acc * vsz..(acc + 1) * vsz].to_vec();
                                 if let Some(c) = con.as_ref() { c.apply(&mut v); }
-                                let want = argmax(&v) as u32;
-                                if want == draft[i] {
-                                    out.push(want);
-                                    if let Some(c) = con.as_mut() { c.advance(want as usize); }
-                                    acc += 1;
-                                    next = want;
-                                } else {
-                                    next = want;
-                                    break;
-                                }
+                                next = argmax(&v) as u32;
                             }
                             mtp_drafted += draft.len();
                             mtp_accepted += acc;
+                            // `next` becomes the following iteration's `tok`,
+                            // which the ordinary path would have advanced when
+                            // it chose it, so advance it here unconditionally.
+                            if let Some(c) = con.as_mut() { c.advance(next as usize); }
                             // KV past the accepted prefix holds rejected tokens;
                             // it is never read, because the next forward writes
                             // those same positions before any attention reads
                             // beyond `pos`.
                             pos += acc + 1;
-                            if acc == 0 {
-                                if let Some(c) = con.as_mut() { c.advance(next as usize); }
-                            }
                             tok = next;
-                            out.pop();
-                            out.push(batch[0]);
                             continue;
                         }
                     }
@@ -1029,6 +1048,7 @@ fn main() {
                     if let Some(c) = con.as_mut() { c.advance(tok as usize); }
                     pos += 1;
                 }
+                dec_secs += t_dec.elapsed().as_secs_f64();
                 nprompt += toks.len();
                 ngenerated += out.len();
                 println!("{}", out.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(","));
@@ -1036,6 +1056,10 @@ fn main() {
             let el = t_all.elapsed().as_secs_f64();
             eprintln!("{} prompts, {} prompt tok, {} generated tok in {:.2}s ({:.1} gen tok/s)",
                       lines.len(), nprompt, ngenerated, el, ngenerated as f64 / el);
+            eprintln!("decode only: {ngenerated} tok in {dec_secs:.2}s ({:.2} tok/s), \
+                       prefill {} tok in {:.2}s ({:.1} tok/s)",
+                      ngenerated as f64 / dec_secs.max(1e-9), nprompt, el - dec_secs,
+                      nprompt as f64 / (el - dec_secs).max(1e-9));
             if con.is_some() {
                 eprintln!("forced steps (LM head skipped): {forced_steps}/{ngenerated} = {:.0}%",
                           100.0 * forced_steps as f64 / ngenerated.max(1) as f64);
