@@ -295,9 +295,14 @@ curl localhost:8080/v1/completions -H 'Content-Type: application/json' \
   -d '{"prompt": "The capital of France is", "max_tokens": 16}'
 ```
 
-Point it at a local file with `--model`, and see the engine's README for the
-CPU compatibility check, the flags, and what the endpoint deliberately does not
-implement (greedy sampling only, no chat endpoint, one request at a time).
+Concurrent requests are decoded together (`--batch`, default 8), which is where
+the throughput above lives: measured on one server with 8 concurrent clients,
+36–41 tok/s aggregate against 7.6–8.0 with batching off, and byte-identical
+output either way.
+
+Point it at a local file with `--model`, and see the engine's README for the CPU
+compatibility check, the flags, and what the endpoint deliberately does not
+implement (greedy sampling only, no chat endpoint).
 
 `FGM_WEIGHTS=int4|int8|auto:M` selects the quantisation (default `auto:16`, the
 AMX tile height — below 16 rows a GEMM cannot fill one tile of rows, so it is

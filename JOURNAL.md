@@ -2078,3 +2078,76 @@ neither, it is the rule, and the rule is what ships.
 **Trap 26 — a constant justified by physics still has to be read from the
 machine.** "It landed exactly on the 2 MB line" was good evidence the model was
 right and no evidence at all that 2 MB was portable.
+
+---
+
+## 33. The server was serving the worst number the engine produces
+
+Shipped `fgm-serve` handling one request at a time, documented it honestly, and
+was asked the obvious question: why does the server serve worse than the
+benchmark that sells it?
+
+There was no good answer. The benchmark's headline — 46.8 tok/s aggregate at
+concurrency 8 — comes from `forward_multi`, where one weight read serves eight
+rows. The server called `forward`, got the batch-1 number, and that is the
+*worst* number this engine produces. Decode here is weight-read bound: a step
+reads ~1.4 GB of int4 weights whether it computes one row or eight, and the
+VNNI kernel's minimum block is eight rows anyway, so seven of those rows were
+being computed and thrown away.
+
+The serialisation was an artefact, not a constraint. `Runner` is a single
+mutable object owning the worker pool, so "one at a time" was the shortest path
+to a server that worked. Documenting that honestly is not the same as it being
+defensible.
+
+### What it took
+
+An engine thread owning the `Runner` and a fixed set of KV slots, a channel of
+jobs in, a channel of events out per request, and a loop that admits arrivals
+into free slots, prefills each on arrival, and runs one `forward_multi` across
+every active slot at its own position. ~200 lines. The engine already had
+everything: `forward_multi` takes per-row positions and a `seq[r]` that indexes
+the cache array, so a batch of sequences at unrelated positions was already a
+supported call.
+
+Same server, 8 concurrent clients × 64 tokens, two runs each:
+
+| | aggregate | per sequence |
+|---|---|---|
+| `--batch 1` | 7.63 / 8.00 tok/s | 0.95 / 1.00 |
+| `--batch 8` | **35.97 / 40.69 tok/s** | 4.50 / 5.09 |
+
+**4.8×.** Scaling on the same server: 5.25 (c=1), 9.97 (c=2), 23.88 (c=4),
+31.98 (c=8) tok/s aggregate.
+
+### The acceptance test
+
+Batching is worth nothing if it changes what a client gets, so that is the test:
+**eight identical prompts sent concurrently produce exactly one distinct
+completion, byte-identical to the same prompt run alone.** Both checked.
+
+### Two things not hidden
+
+Prefill is *not* batched across sequences — it is compute-bound and already runs
+256 rows per forward — so a request arriving mid-generation stalls the batch for
+the length of its own prefill. That is a TTFT cost, not a throughput one, and it
+is the honest trade for a scheduler this size.
+
+Streaming holds back a trailing run of U+FFFD before emitting a delta. `decode`
+runs the whole emitted run through `from_utf8_lossy` every step, so a multi-byte
+character still missing its tail appears as a replacement character that a later
+step fixes. Streaming that byte range sends the client something it can never
+take back, *and* leaves the sent-cursor pointing past text that has since
+changed.
+
+**Trap 27 — documenting a shortcoming is not the same as it being acceptable.**
+The README said plainly that batched decode existed and was not wired into the
+HTTP path. That sentence was true, and it let a bad deliverable feel finished:
+the product was measurably five times slower than the thing being advertised,
+and the note made it look like a known limitation rather than missing work. A
+limitation is something physics imposes. This was a to-do with a paragraph in
+front of it.
+
+And once more, from the same family as Traps 12 and 19: `pkill -f "fgm-serve
+--model"` matched the A/B script's own command line and killed the harness
+mid-run. Third self-matching process match in this project. `pkill -x`.
