@@ -102,6 +102,8 @@ curl localhost:8080/v1/completions \
 --addr HOST:PORT   listen address (default 127.0.0.1:8080)
 --threads N        worker threads (default: all cores)
 --ctx N            max context in tokens (default 8192)
+--batch N          sequences decoded together (default 8); one KV cache
+                   is allocated per slot up front
 --no-download      fail instead of fetching anything
 ```
 
@@ -122,10 +124,23 @@ curl localhost:8080/v1/completions \
 chat template, and getting Gemma 4's wrong is a silent accuracy loss rather than
 an error. Send the formatted prompt yourself.
 
-Requests are served **one at a time**. The engine owns a thread pool sized to
-the machine; accepting concurrently would contend for the same cores and make
-every request slower. Batched multi-sequence decode exists in the engine and is
-exercised by `fgm-bench serve` — it is not wired into the HTTP path yet.
+Concurrent requests are **decoded together**, up to `--batch` (default 8). This
+is where the engine's throughput actually lives: a decode step reads ~1.4 GB of
+int4 weights whether it computes one row or eight, so eight sequences cost about
+what one costs. Measured on the same server, 8 concurrent clients × 64 tokens:
+
+| | aggregate | per sequence |
+|---|---|---|
+| `--batch 1` | 7.6–8.0 tok/s | 0.95–1.00 |
+| `--batch 8` | **36.0–40.7 tok/s** | 4.50–5.09 |
+
+**4.8×**, and the output is byte-identical: eight identical prompts sent
+concurrently produce one distinct completion, equal to the same prompt run
+alone.
+
+Prefill is not batched across sequences — it is compute-bound and already runs
+256 rows per forward — so a request arriving mid-generation stalls the batch for
+the length of its own prefill. That is a TTFT cost, not a throughput one.
 
 These are rejected rather than ignored, because silently downgrading a request
 returns wrong results instead of degraded ones:

@@ -17,14 +17,17 @@
 //! because a client that asks for `temperature: 0.8` and is handed greedy
 //! output has been given wrong results, not degraded ones.
 
+mod engine;
 mod fetch;
 mod http;
 mod tokenizer;
 
-use fgm_core::{KvCache, Model, Runner};
+use engine::{Event, Job};
+use fgm_core::Model;
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
-use std::time::Instant;
+use std::sync::mpsc;
+use std::sync::Arc;
 use tokenizer::Tokenizer;
 
 const PREFILL_CHUNK: usize = 256;
@@ -36,6 +39,7 @@ struct Args {
     addr: String,
     threads: usize,
     ctx: usize,
+    batch: usize,
     no_download: bool,
 }
 
@@ -53,6 +57,8 @@ USAGE
     --addr HOST:PORT   listen address (default 127.0.0.1:8080)
     --threads N        worker threads (default: all cores)
     --ctx N            max context in tokens (default 8192)
+    --batch N          concurrent sequences decoded together (default 8).
+                       One KV cache is allocated per slot up front.
     --no-download      fail instead of fetching anything
 
 ENDPOINTS
@@ -78,6 +84,7 @@ fn parse_args() -> Args {
         addr: "127.0.0.1:8080".into(),
         threads: std::thread::available_parallelism().map(|v| v.get()).unwrap_or(4),
         ctx: 8192,
+        batch: 8,
         no_download: false,
     };
     let mut it = std::env::args().skip(1);
@@ -89,6 +96,7 @@ fn parse_args() -> Args {
             "--addr" => a.addr = next(),
             "--threads" | "-t" => a.threads = next().parse().unwrap_or_else(|_| usage()),
             "--ctx" => a.ctx = next().parse().unwrap_or_else(|_| usage()),
+            "--batch" | "-b" => a.batch = next().parse().unwrap_or_else(|_| usage()),
             "--no-download" => a.no_download = true,
             "--help" | "-h" => usage(),
             _ => usage(),
@@ -143,16 +151,6 @@ fn resolve(a: &Args) -> std::io::Result<(String, String)> {
     Ok((model, tok))
 }
 
-fn argmax(v: &[f32]) -> usize {
-    let mut best = (0usize, f32::NEG_INFINITY);
-    for (i, &x) in v.iter().enumerate() {
-        if x > best.1 {
-            best = (i, x);
-        }
-    }
-    best.0
-}
-
 /// Fields we accept but cannot honour. Rejecting is the whole point: silently
 /// ignoring `temperature` turns "your sampler is greedy-only" into "your model
 /// gives strange answers".
@@ -185,170 +183,152 @@ fn stops_from(req: &serde_json::Value) -> Vec<String> {
     }
 }
 
-struct Server<'m> {
-    runner: Runner<'m>,
-    tok: Tokenizer,
-    cfg: fgm_core::model::Config,
+/// Per-connection state. The heavy objects live on the engine thread; a
+/// connection holds only what it needs to speak HTTP.
+#[derive(Clone)]
+struct Ctx {
+    tok: Arc<Tokenizer>,
+    jobs: mpsc::Sender<Job>,
     model_id: String,
     ctx: usize,
 }
 
-impl<'m> Server<'m> {
-    fn completions(&mut self, stream: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
-        let req: serde_json::Value = match serde_json::from_slice(body) {
-            Ok(v) => v,
-            Err(e) => return http::json_error(stream, 400, &format!("invalid JSON: {e}"), "invalid_request_error"),
-        };
-        if let Some(msg) = unsupported(&req) {
-            return http::json_error(stream, 400, &msg, "invalid_request_error");
+fn completions(c: &Ctx, stream: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
+    let req: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return http::json_error(stream, 400, &format!("invalid JSON: {e}"), "invalid_request_error")
         }
-        // OpenAI allows a token-id array here; accept text only and say so.
-        let Some(prompt) = req.get("prompt").and_then(|p| p.as_str()) else {
-            return http::json_error(
-                stream, 400,
-                "`prompt` must be a string (token-id arrays are not accepted)",
-                "invalid_request_error",
-            );
-        };
-        let max_tokens = req.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(64) as usize;
-        let stream_mode = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-        let stops = stops_from(&req);
-
-        let toks = self.tok.encode(prompt, true);
-        if toks.len() + max_tokens > self.ctx {
-            return http::json_error(
-                stream, 400,
-                &format!(
-                    "prompt is {} tokens and max_tokens is {max_tokens}, which exceeds the \
-                     {}-token context this server was started with (--ctx)",
-                    toks.len(), self.ctx
-                ),
-                "invalid_request_error",
-            );
-        }
-
-        let t0 = Instant::now();
-        let mut cache = KvCache::new(&self.cfg, self.ctx, PREFILL_CHUNK);
-        let mut off = 0usize;
-        let mut tok = 0u32;
-        while off < toks.len() {
-            let n = PREFILL_CHUNK.min(toks.len() - off);
-            let lg = self.runner.forward(&toks[off..off + n], off, &mut cache);
-            if off + n >= toks.len() {
-                tok = argmax(lg) as u32;
-            }
-            off += n;
-        }
-        let ttft = t0.elapsed().as_secs_f64();
-
-        if stream_mode {
-            http::sse_open(stream)?;
-        }
-        let id = format!("cmpl-{}", std::process::id());
-        let created = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        let mut out_ids: Vec<u32> = Vec::with_capacity(max_tokens);
-        let mut text = String::new();
-        let mut sent = 0usize;  // bytes of `text` already streamed
-        let mut pos = toks.len();
-        let mut finish = "length";
-        for _ in 0..max_tokens {
-            if self.tok.eos.contains(&tok) {
-                finish = "stop";
-                break;
-            }
-            out_ids.push(tok);
-            // Decode the whole run each step rather than per token: a UTF-8
-            // character can span several byte-fallback tokens, and decoding
-            // them individually emits replacement characters mid-word.
-            text = self.tok.decode(&out_ids, true);
-            if let Some(cut) = stops.iter().filter_map(|s| text.find(s.as_str())).min() {
-                text.truncate(cut);
-                finish = "stop";
-                break;
-            }
-            if stream_mode && text.len() > sent {
-                let delta = text[sent..].to_string();
-                sent = text.len();
-                http::sse_send(stream, &serde_json::json!({
-                    "id": id, "object": "text_completion", "created": created,
-                    "model": self.model_id,
-                    "choices": [{ "text": delta, "index": 0, "finish_reason": null }],
-                }))?;
-            }
-            tok = argmax(self.runner.forward(&[tok], pos, &mut cache)) as u32;
-            pos += 1;
-        }
-        let el = t0.elapsed().as_secs_f64();
-        eprintln!(
-            "  {} prompt + {} gen tok  ttft {:.2}s  {:.1} tok/s decode",
-            toks.len(), out_ids.len(), ttft,
-            out_ids.len() as f64 / (el - ttft).max(1e-9)
+    };
+    if let Some(msg) = unsupported(&req) {
+        return http::json_error(stream, 400, &msg, "invalid_request_error");
+    }
+    // OpenAI allows a token-id array here; accept text only and say so.
+    let Some(prompt) = req.get("prompt").and_then(|p| p.as_str()) else {
+        return http::json_error(
+            stream, 400,
+            "`prompt` must be a string (token-id arrays are not accepted)",
+            "invalid_request_error",
         );
+    };
+    let max_tokens = req.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(64) as usize;
+    let stream_mode = req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let stops = stops_from(&req);
 
-        let usage = serde_json::json!({
-            "prompt_tokens": toks.len(),
-            "completion_tokens": out_ids.len(),
-            "total_tokens": toks.len() + out_ids.len(),
-        });
-        if stream_mode {
-            if text.len() > sent {
-                http::sse_send(stream, &serde_json::json!({
-                    "id": id, "object": "text_completion", "created": created,
-                    "model": self.model_id,
-                    "choices": [{ "text": text[sent..], "index": 0, "finish_reason": null }],
-                }))?;
-            }
-            http::sse_send(stream, &serde_json::json!({
-                "id": id, "object": "text_completion", "created": created,
-                "model": self.model_id,
-                "choices": [{ "text": "", "index": 0, "finish_reason": finish }],
-                "usage": usage,
-            }))?;
-            return http::sse_done(stream);
-        }
-        let resp = serde_json::json!({
-            "id": id, "object": "text_completion", "created": created,
-            "model": self.model_id,
-            "choices": [{ "text": text, "index": 0, "logprobs": null, "finish_reason": finish }],
-            "usage": usage,
-        });
-        http::respond(stream, 200, "application/json", resp.to_string().as_bytes())
+    let toks = c.tok.encode(prompt, true);
+    if toks.len() + max_tokens > c.ctx {
+        return http::json_error(
+            stream, 400,
+            &format!(
+                "prompt is {} tokens and max_tokens is {max_tokens}, which exceeds the \
+                 {}-token context this server was started with (--ctx)",
+                toks.len(), c.ctx
+            ),
+            "invalid_request_error",
+        );
     }
 
-    fn handle(&mut self, mut stream: TcpStream) {
-        let req = match http::read_request(&stream, MAX_BODY) {
-            Ok(Some(r)) => r,
-            Ok(None) => return,
-            Err(e) => {
-                let _ = http::json_error(&mut stream, 413, &e.to_string(), "invalid_request_error");
-                return;
+    let (tx, rx) = mpsc::channel::<Event>();
+    if c.jobs.send(Job { toks, max_tokens, stops, tx }).is_err() {
+        return http::json_error(stream, 500, "engine is not running", "server_error");
+    }
+
+    let id = format!("cmpl-{:x}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0));
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    if stream_mode {
+        http::sse_open(stream)?;
+    }
+    let mut text = String::new();
+    loop {
+        match rx.recv() {
+            Ok(Event::Text(t)) => {
+                if stream_mode {
+                    http::sse_send(stream, &serde_json::json!({
+                        "id": id, "object": "text_completion", "created": created,
+                        "model": c.model_id,
+                        "choices": [{ "text": t, "index": 0, "finish_reason": null }],
+                    }))?;
+                } else {
+                    text.push_str(&t);
+                }
             }
-        };
-        let path = req.path.split('?').next().unwrap_or("/").to_string();
-        let r = match (req.method.as_str(), path.as_str()) {
-            ("POST", "/v1/completions") => self.completions(&mut stream, &req.body),
-            ("GET", "/v1/models") => {
-                let b = serde_json::json!({
-                    "object": "list",
-                    "data": [{ "id": self.model_id, "object": "model", "owned_by": "fastgemma" }],
+            Ok(Event::Done { finish, prompt_tokens, completion_tokens }) => {
+                let usage = serde_json::json!({
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
                 });
-                http::respond(&mut stream, 200, "application/json", b.to_string().as_bytes())
+                if stream_mode {
+                    http::sse_send(stream, &serde_json::json!({
+                        "id": id, "object": "text_completion", "created": created,
+                        "model": c.model_id,
+                        "choices": [{ "text": "", "index": 0, "finish_reason": finish }],
+                        "usage": usage,
+                    }))?;
+                    return http::sse_done(stream);
+                }
+                let resp = serde_json::json!({
+                    "id": id, "object": "text_completion", "created": created,
+                    "model": c.model_id,
+                    "choices": [{ "text": text, "index": 0, "logprobs": null,
+                                  "finish_reason": finish }],
+                    "usage": usage,
+                });
+                return http::respond(stream, 200, "application/json", resp.to_string().as_bytes());
             }
-            ("GET", "/health") => http::respond(&mut stream, 200, "text/plain", b"ok\n"),
-            ("OPTIONS", _) => http::respond(&mut stream, 200, "text/plain", b""),
-            _ => http::json_error(
-                &mut stream, 404,
-                &format!("no route for {} {path}; this server implements /v1/completions only", req.method),
-                "invalid_request_error",
-            ),
-        };
-        if let Err(e) = r {
-            eprintln!("fastgemma: response failed: {e}");
+            Ok(Event::Error(e)) => {
+                if stream_mode {
+                    let _ = http::sse_send(stream, &serde_json::json!({ "error": { "message": e } }));
+                    return http::sse_done(stream);
+                }
+                return http::json_error(stream, 500, &e, "server_error");
+            }
+            // The engine dropped the sender without a Done, which means it
+            // died. Say so rather than returning a truncated 200.
+            Err(_) => {
+                if stream_mode {
+                    return http::sse_done(stream);
+                }
+                return http::json_error(stream, 500, "engine stopped mid-request", "server_error");
+            }
         }
+    }
+}
+
+fn handle(c: &Ctx, mut stream: TcpStream) {
+    let req = match http::read_request(&stream, MAX_BODY) {
+        Ok(Some(r)) => r,
+        Ok(None) => return,
+        Err(e) => {
+            let _ = http::json_error(&mut stream, 413, &e.to_string(), "invalid_request_error");
+            return;
+        }
+    };
+    let path = req.path.split('?').next().unwrap_or("/").to_string();
+    let r = match (req.method.as_str(), path.as_str()) {
+        ("POST", "/v1/completions") => completions(c, &mut stream, &req.body),
+        ("GET", "/v1/models") => {
+            let b = serde_json::json!({
+                "object": "list",
+                "data": [{ "id": c.model_id, "object": "model", "owned_by": "fastgemma" }],
+            });
+            http::respond(&mut stream, 200, "application/json", b.to_string().as_bytes())
+        }
+        ("GET", "/health") => http::respond(&mut stream, 200, "text/plain", b"ok\n"),
+        ("OPTIONS", _) => http::respond(&mut stream, 200, "text/plain", b""),
+        _ => http::json_error(
+            &mut stream, 404,
+            &format!("no route for {} {path}; this server implements /v1/completions only", req.method),
+            "invalid_request_error",
+        ),
+    };
+    if let Err(e) = r {
+        eprintln!("fastgemma: response failed: {e}");
     }
 }
 
@@ -396,12 +376,10 @@ fn main() {
         a.threads
     );
 
-    let runner = Runner::new(&model, PREFILL_CHUNK, a.ctx, a.threads);
     let model_id = std::path::Path::new(&model_path)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "fastgemma".into());
-    let mut srv = Server { runner, tok, cfg, model_id, ctx: a.ctx };
 
     let listener = match TcpListener::bind(&a.addr) {
         Ok(l) => l,
@@ -410,15 +388,49 @@ fn main() {
             std::process::exit(1);
         }
     };
-    eprintln!("fastgemma: listening on http://{}  (POST /v1/completions)", a.addr);
-    let _ = std::io::stderr().flush();
 
-    // Serial by design: one Runner, one thread pool sized to the machine.
-    // Accepting concurrently would just make every request slower.
-    for s in listener.incoming() {
-        match s {
-            Ok(s) => srv.handle(s),
-            Err(e) => eprintln!("fastgemma: accept failed: {e}"),
+    let tok = Arc::new(tok);
+    let (jobs_tx, jobs_rx) = mpsc::channel::<Job>();
+
+    // The engine borrows `model` and `tok` for its whole life and so does the
+    // process; a scoped thread says exactly that without an Arc<Model> or a
+    // leak. Connection threads are spawned inside the scope so the scope only
+    // ends when the listener loop does.
+    std::thread::scope(|scope| {
+        let etok = tok.clone();
+        scope.spawn(move || {
+            engine::run(
+                &model,
+                &etok,
+                engine::Config {
+                    ctx: a.ctx,
+                    batch: a.batch.max(1),
+                    threads: a.threads,
+                    prefill_chunk: PREFILL_CHUNK,
+                },
+                jobs_rx,
+            );
+        });
+
+        eprintln!(
+            "fastgemma: listening on http://{}  (POST /v1/completions, batch {})",
+            a.addr, a.batch
+        );
+        let _ = std::io::stderr().flush();
+
+        let ctx = Ctx { tok, jobs: jobs_tx, model_id, ctx: a.ctx };
+        for s in listener.incoming() {
+            match s {
+                Ok(s) => {
+                    // One thread per connection. They do no inference -- they
+                    // encode, hand a job to the engine and copy events back --
+                    // so the cost is a stack, and it is what lets eight clients
+                    // be in flight at once for the engine to batch.
+                    let c = ctx.clone();
+                    scope.spawn(move || handle(&c, s));
+                }
+                Err(e) => eprintln!("fastgemma: accept failed: {e}"),
+            }
         }
-    }
+    });
 }
