@@ -9,15 +9,17 @@ tags:
   - int4
   - int8
   - amx
+  - avx512
   - fastgemma
 library_name: fastgemma
 pipeline_tag: text-generation
 ---
 
-# fastgemma — Gemma 4 E2B, CPU-only, AMX INT8
+# fastgemma — Gemma 4 E2B, CPU-only, AMX INT8 / AVX-512 VNNI
 
 Weights for [fastgemma](https://github.com/martinobettucci/fastgemma), a CPU-only
-inference engine for Gemma 4 built around Intel **AMX INT8** tile matrix units.
+inference engine for Gemma 4 built around Intel **AMX INT8** tile matrix units,
+with an **AVX-512 VNNI** path for hosts without them.
 
 These are **not** safetensors and will not load in `transformers`. The `.fgm`
 format stores weights already quantised, Hadamard-rotated and pre-packed into
@@ -60,12 +62,25 @@ and is what makes the prefill/decode split below possible.
 
 ## Hardware requirement
 
-**Requires AMX-INT8** — Sapphire Rapids or newer Xeon. There is no fallback
-path; the engine asserts on `XTILEDATA` permission at startup.
+**Minimum: AVX-512 with VNNI** (Skylake-SP with VNNI / Cascade Lake / Ice Lake
+and newer). **Recommended: AMX-INT8** (Sapphire Rapids or newer Xeon).
 
-Reference machine for every number here: Intel Xeon (Sapphire Rapids class),
-**4 cores @ 2.1 GHz**, 15 GB RAM, no GPU. Measured ceilings: AMX INT8 14.69
-TOPS, AVX512-VNNI 1.16 TOPS, DRAM 33 GB/s.
+The engine picks its GEMM backend from CPUID at startup and prints which one it
+took. Both read the same `.fgm` file — the weight layout is AMX tile order,
+which *is* VNNI operand order chunked sixteen rows at a time, so there is no
+second file and no runtime repacking on either path. `FGM_BACKEND=amx|vnni`
+forces the choice on a host that has both.
+
+The two backends are not close in speed, and the numbers below are reported
+per backend rather than blended. AMX INT8 is 12.7× AVX512-VNNI on the same
+silicon (14.69 vs 1.16 TOPS measured); expect prefill to fall by roughly half
+without it, and single-stream decode — which is memory-bound, not
+multiply-bound — to move much less.
+
+Reference machines. **AMX numbers:** Intel Xeon (Sapphire Rapids class), 4
+cores @ 2.1 GHz, 15 GB RAM. Measured ceilings AMX INT8 14.69 TOPS, AVX512-VNNI
+1.16 TOPS, DRAM 33 GB/s. **AVX-512 numbers:** Intel Xeon (Cascade Lake class,
+no AMX), 4 cores @ 2.8 GHz, 16 GB RAM, 1 MB L2 per core.
 
 ## Measured performance
 
@@ -108,8 +123,11 @@ measured, the total is arithmetic.
 ## vs llama.cpp
 
 Same box, 4 threads, same bit width: Google's own QAT Q4_0 GGUF (llama.cpp
-build 91f8c9c) against fastgemma's int4 group-256. Engines alternated within
-the run so platform drift is shared rather than landing on one side.
+build 91f8c9c) against fastgemma. Engines alternated within each run so
+platform drift is shared rather than landing on one side. Median of 3, full
+range in brackets.
+
+### On AMX — int4 group-256 both sides, no speculative decoding
 
 | | fastgemma | llama.cpp | |
 |---|---|---|---|
@@ -117,21 +135,63 @@ the run so platform drift is shared rather than landing on one side.
 | prefill 2048 | **192.7** [184.9–200.5] | 114.1 ± 2.7 | **+69%** |
 | decode (tg64, batch 1) | 13.6 [11.6–14.5] | **14.9–16.9** | llama.cpp +10–24% |
 
+### On AVX-512 VNNI — no AMX on either side
+
+Both binaries target the same ISA class here: llama.cpp built with
+`GGML_NATIVE=OFF` and an explicit AVX512+VNNI feature set, fastgemma on its
+VNNI backend.
+
+| | fastgemma int4 | fastgemma dual | llama.cpp | best |
+|---|---|---|---|---|
+| prefill 512 | 108.9 [108.1–110.8] | **124.6** [121.9–128.7] | 68.6 [68.3–69.0] | **+82%** |
+| prefill 2048 | 96.2 [92.3–98.5] | **113.9** [106.1–115.9] | 60.8 [60.1–61.1] | **+87%** |
+| decode (tg64, batch 1) | 7.9 | 7.4 | **12.3** [11.0–12.6] | llama.cpp +66% |
+
+**The prefill margin is the same order with and without AMX** (+56/+69% there,
++82/+87% here), which is the useful thing this table says: the advantage comes
+from the int8 activation path, the pre-packed weights and the absence of any
+runtime repack — not from the tile units. AMX makes both sides' absolute
+numbers larger; it is not where the ratio comes from.
+
+### Speculative decoding, AVX-512 backend
+
+Decode above is raw single-stream with no speculation, which is what
+`llama-bench` measures. On the actual tool-calling workload — 25 requests,
+grammar-constrained, decode timed separately from prefill — the engine's two
+weight-free multi-token paths give:
+
+| | decode tok/s | |
+|---|---|---|
+| baseline | 7.87 [7.83–8.15] | |
+| grammar-forced batching | 8.41 [8.37–8.57] | +1.6% |
+| prompt-lookup, k=4 | 9.06 [8.67–9.18] | +15.1% |
+| **both** | **9.19** [9.08–9.22] | **+16.8%** |
+
+All 25 generated sequences are **byte-identical to baseline** in every arm.
+Grammar batching is exact by construction — a token the DFA forces is
+determined without consulting the model — and prompt-lookup drafts are verified
+against the model before acceptance (193/956 drafted tokens accepted, 20%).
+Neither trades accuracy for speed.
+
+This is not comparable to the `llama-bench` decode column: that measures free
+generation from synthetic tokens, where prompt-lookup has nothing to copy. It
+is reported here because it is the number that applies to the workload this
+engine was built for. Even with it, llama.cpp is ahead on single-stream decode.
+
 Three caveats that belong with these numbers, not under them:
 
 - **Decode favours llama.cpp single-stream.** At batch 1 decode is pure memory
-  bandwidth, AMX has nothing to amortise, and their Q4_0 kernels are very well
-  tuned. fastgemma's decode advantage appears only under batching — 46.8 tok/s
-  aggregate at concurrency 8 — and claiming a decode win without that qualifier
-  would be false.
+  bandwidth, there is nothing for a matrix unit to amortise, and their Q4_0
+  kernels are very well tuned. fastgemma's decode advantage appears only under
+  batching — 46.8 tok/s aggregate at concurrency 8 on AMX — and claiming a
+  decode win without that qualifier would be false.
 - **This is a speed comparison only.** llama.cpp runs a quantisation-aware
   *trained* checkpoint; these weights are post-training quantised from bf16.
   Different accuracy starting points, and no behavioural comparison between the
   two engines exists. A throughput ratio does not license a claim about which
   engine is better.
-- **Only fastgemma uses AMX**, and this reference host's tile-state corruption
-  rate drifts between runs — visible as the wider fastgemma spread. Ranges are
-  quoted for that reason.
+- **AMX and AVX-512 rows are from different machines** at different clocks and
+  are not comparable to each other. Compare within a table, never across.
 
 ## Why AMX for GEMM but not for attention
 

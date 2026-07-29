@@ -379,11 +379,47 @@ pub fn rowbatch_scratch(n_heads: usize, cap: usize, head_dim: usize) -> usize {
 /// that the reductions dominate and above it the bandwidth does. Measured
 /// crossovers sit on the 2 MB line -- head_dim 512 at ctx 4096 and head_dim 256
 /// at ctx 8192 are both exactly 2 MB.
-pub const L2_PER_CORE: usize = 2 << 20;
+/// Fallback when the cache size cannot be read. 2 MB is the Sapphire Rapids
+/// figure the crossover was originally fitted on.
+pub const L2_PER_CORE_DEFAULT: usize = 2 << 20;
+
+/// Per-core L2, read from sysfs once.
+///
+/// This was a hardcoded 2 MB, which is the Sapphire Rapids number. A Cascade
+/// Lake host has 1 MB, so the rule kept head-outer attention at spans where
+/// head-batching had already won — the crossover is physical, and a physical
+/// constant that does not follow the machine is just a guess that happened to
+/// be right once.
+pub fn l2_per_core() -> usize {
+    use std::sync::OnceLock;
+    static L2: OnceLock<usize> = OnceLock::new();
+    *L2.get_or_init(|| {
+        for i in 0..8 {
+            let base = format!("/sys/devices/system/cpu/cpu0/cache/index{i}");
+            let lvl = std::fs::read_to_string(format!("{base}/level"));
+            let sz = std::fs::read_to_string(format!("{base}/size"));
+            if let (Ok(l), Ok(s)) = (lvl, sz) {
+                if l.trim() != "2" {
+                    continue;
+                }
+                let s = s.trim();
+                let (num, mul) = match s.chars().last() {
+                    Some('K') => (&s[..s.len() - 1], 1 << 10),
+                    Some('M') => (&s[..s.len() - 1], 1 << 20),
+                    _ => (s, 1),
+                };
+                if let Ok(v) = num.parse::<usize>() {
+                    return v * mul;
+                }
+            }
+        }
+        L2_PER_CORE_DEFAULT
+    })
+}
 
 #[inline]
 pub fn rowbatch_worthwhile(kv_heads: usize, head_dim: usize, span: usize) -> bool {
-    kv_heads == 1 && span * head_dim > L2_PER_CORE
+    kv_heads == 1 && span * head_dim > l2_per_core()
 }
 
 /// Force the scalar P.V weight fill, for A/B against the vectorised one inside
