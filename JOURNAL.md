@@ -1933,3 +1933,148 @@ check has been written to confirm rather than to contradict (the first was the
 u8 softmax weights, where the model *did* contradict and was right). The test
 that would have caught it is the one that pins a convention to literals taken
 from the other implementation, not to a formula re-derived from memory.
+
+---
+
+## 30. Both MTP paths, measured at last — and the one that was wrong
+
+Section 28 sized both weight-free multi-token paths without being able to run
+them. Now they run. 25 tool-calling prompts, grammar-constrained, arms
+alternating within each pass, three passes, **decode timed separately from
+prefill** — decode is a quarter of this harness's wall clock, so an 11% decode
+win arrives as 3% of the total and dies in the noise. Timing the whole run
+would have measured nothing and reported it as "no effect".
+
+| arm | decode tok/s | vs baseline |
+|---|---|---|
+| baseline | 7.87 [7.83–8.15] | |
+| grammar-forced batching | 8.41 [8.37–8.57] | +1.6% |
+| prompt-lookup, k=4 | 9.06 [8.67–9.18] | +15.1% |
+| **both** | **9.19** [9.08–9.22] | **+16.8%** |
+
+Ranges disjoint against baseline in every case. Prefill unchanged, as it must
+be — neither path touches it.
+
+### The acceptance test that matters, and failed
+
+Both paths are supposed to be *indistinguishable from not using them*: grammar
+batching is exact by construction, prompt-lookup drafts are verified against
+the model. So the test is byte-identity of all 25 generated sequences against
+baseline, and on the first run:
+
+    gram: IDENTICAL (3/3 passes)
+    look: DIFFERS   (25 of 25 lines, 3/3 passes) -- 1403 tokens vs 940
+
+Two bugs, both in bookkeeping rather than in the idea:
+
+- The verification forward produces `draft.len() + 1` rows. Row *i* predicts
+  what follows `batch[i]`, so rows `0..len-1` check the drafts and **the last
+  row is the continuation after a fully accepted draft**. That row was thrown
+  away, leaving `next` holding the token just accepted — so an all-accepted
+  draft re-emitted its own last token.
+- An `out.pop()` / `out.push(batch[0])` pair deleted an accepted token and
+  duplicated the current one.
+
+Plus two smaller ones: the grammar was advanced for the replacement token only
+when nothing was accepted, and an accepted EOS was pushed into the output where
+the ordinary path breaks before pushing it.
+
+Fixed, all three passes are identical to baseline, and the throughput above is
+what was left once the extra 463 tokens of garbage stopped being counted as
+work. **The wrong version looked faster in every arm** — 8.84 tok/s against
+8.32 — because it was generating more tokens per second and most of them were
+wrong.
+
+### Grammar batching is real but a sixth of its estimate
+
+Section 28 predicted 11% of decode steps collapsible. Measured: **17 of 940,
+1.8%.** The DFA-level estimate counted collapsible tokens inside a canonical
+tool call; a real generation spends most of its tokens outside one. The
+estimate was not wrong about the grammar, it was wrong about the workload.
+
+Kept anyway: exact, free, and it composes — 14 steps still collapse with
+lookup on.
+
+**Trap 25 — "faster" and "more tokens per second" are the same number only if
+the tokens are the same.** Speculative decoding's throughput metric has the
+acceptance test built into its denominator, and a broken verifier inflates the
+numerator. The identity check is not an extra; it is the measurement.
+
+---
+
+## 31. fastgemma vs llama.cpp without AMX
+
+Same box, 4 threads, engines alternating within each pass, 3 passes, median
+[range]. llama.cpp 91f8c9c against Google's QAT Q4_0 GGUF.
+
+| | fastgemma int4 | fastgemma dual | llama.cpp | best |
+|---|---|---|---|---|
+| prefill 512 | 108.9 [108.1–110.8] | **124.6** [121.9–128.7] | 68.6 [68.3–69.0] | **+82%** |
+| prefill 2048 | 96.2 [92.3–98.5] | **113.9** [106.1–115.9] | 60.8 [60.1–61.1] | **+87%** |
+| decode tg64 | 7.9 | 7.4 | **12.3** [11.0–12.6] | llama.cpp +66% |
+
+The interesting line is the ratio, not the absolute numbers: **+82/+87% here
+against +56/+69% on AMX.** The prefill advantage is not coming from the tile
+units. It is the int8 activation path, the pre-packed weights and the absence
+of any runtime repack — AMX makes both sides' absolute numbers larger without
+being where the ratio comes from.
+
+Single-stream decode goes the other way on both backends, and by more here.
+Even with both speculative paths on (9.19 tok/s) it does not close.
+
+### Two harness failures, both already in this journal as traps
+
+**llama-bench SIGILL'd.** Built with `GGML_NATIVE=ON` on a Sapphire Rapids
+host, so the binary carried instructions this CPU lacks — the same ISA leak
+that made our own `ops.c` SIGILL, arriving from the opposite direction.
+Rebuilt with `GGML_NATIVE=OFF` and an explicit AVX512+VNNI feature set, which
+is also the *matched* comparison: both engines now target the same ISA class.
+
+**The awk parse read column 7 where the throughput is column 8**, so llama.cpp
+reported empty for every row. That is Trap 19 — "a parser bug looks exactly
+like the other side losing" — recurring **in the same script that first
+recorded it**, because the comparison was re-derived rather than re-read.
+
+And cold page cache read 2.5 tok/s prefill on the first attempt, which looks
+like the engine being 40× slower than it is. Every model file is warmed before
+the first pass now.
+
+---
+
+## 32. A physical constant that did not follow the machine
+
+The head-batching shape rule keys on whether one layer's K working set clears
+the per-core L2 — a genuinely physical crossover, and the thing that made it
+trustworthy was that the measured crossovers landed exactly on the 2 MB line
+rather than on a fitted number. The 2 MB was then hardcoded.
+
+This host has **1 MB**. So the rule was declining head-batching at spans where
+it had already won, for the whole first day of measurement on it.
+`l2_per_core()` now reads `/sys/devices/system/cpu/cpu0/cache/index*/size`
+once, falling back to 2 MB.
+
+End to end at 8192, arms alternating, 3 passes:
+
+| | prefill tok/s | decode tok/s |
+|---|---|---|
+| off (head-outer) | 78.1 [77.9–78.3] | 6.3 [6.0–7.0] |
+| shape rule (default) | 77.6 [77.5–81.5] | 6.6 [6.2–6.8] |
+| forced on everywhere | 79.9 [79.0–86.0] | 5.8 [5.6–5.8] |
+
+Head-batching is near-neutral on this backend, and the rule is earning its
+keep: forcing it on buys ~2% prefill and costs ~8% decode, because a sliding
+layer decodes against a 512-position window — 128 KB of K, nowhere near any
+L2 — where the head-outer kernel's four-position reduction amortisation wins.
+
+The gap between this and the 2.59× the standalone Q·Kᵀ benchmark shows is the
+usual dilution, worse here: with the VNNI GEMM at an eighth of AMX's rate,
+`ffn_gemm` is 62–67% of prefill and attention is a correspondingly smaller
+slice of what is left to win.
+
+The first version of this A/B compared **forced-on against forced-off** and
+read +6.6% prefill / −19% decode. Both arms were wrong to run: the default is
+neither, it is the rule, and the rule is what ships.
+
+**Trap 26 — a constant justified by physics still has to be read from the
+machine.** "It landed exactly on the 2 MB line" was good evidence the model was
+right and no evidence at all that 2 MB was portable.

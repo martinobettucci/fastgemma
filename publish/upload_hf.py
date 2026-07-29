@@ -59,6 +59,8 @@ def main():
     ap.add_argument("--weights", nargs="+", default=["/home/user/models/g4e2b-dual.fgm"])
     ap.add_argument("--card", default=str(ROOT / "publish" / "MODEL_CARD.md"))
     ap.add_argument("--private", action="store_true", help="create the repo private")
+    ap.add_argument("--card-only", action="store_true",
+                    help="push only the model card; the weights on the repo are unchanged")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
@@ -70,7 +72,7 @@ def main():
         sys.exit("model card does not carry the Gemma Terms of Use -- refusing to upload")
 
     files = []
-    for w in a.weights:
+    for w in ([] if a.card_only else a.weights):
         p = pathlib.Path(w)
         if not p.exists():
             sys.exit(f"missing weight file: {p}")
@@ -99,6 +101,8 @@ def main():
     api.create_repo(a.repo, repo_type="model", private=a.private, exist_ok=True)
     api.upload_file(path_or_fileobj=str(card), path_in_repo="README.md",
                     repo_id=a.repo, repo_type="model")
+    if a.card_only:
+        print("card only -- weights on the repo left as they are")
     for p in files:
         print(f"uploading {p.name} ({p.stat().st_size/1e9:.2f} GB) ...")
         api.upload_file(path_or_fileobj=str(p), path_in_repo=p.name,
