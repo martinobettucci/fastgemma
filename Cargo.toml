@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/fgm-kernels", "crates/fgm-core", "crates/fgm-bench"]
+members = ["crates/fgm-kernels", "crates/fgm-core", "crates/fgm-bench", "crates/fgm-serve"]
 
 [profile.release]
 opt-level = 3

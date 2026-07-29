@@ -11,6 +11,18 @@
 // the one `_Float16` scale load in fgm_gather_q4r lowered to `vcvtsh2ss`, and
 // ops.c -- which contains no AMX at all -- SIGILL'd on a VNNI-only host.
 fn main() {
+    // Fail here, with a sentence, rather than a hundred lines of "unknown type
+    // name __m512i" from the C compiler. The kernels are 512-bit x86
+    // intrinsics from top to bottom; there is no portable path to fall back to.
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("x86_64") {
+        panic!(
+            "fastgemma targets x86-64 with AVX-512 and VNNI. The GEMM and \
+             attention kernels are 512-bit intrinsics with no scalar fallback, \
+             and the weight format on disk is a VNNI operand layout. There is \
+             nothing to build for this target."
+        );
+    }
+
     // -O2, deliberately: GCC -O3 sinks the AVX stores that fill the int4 unpack
     // buffer past the _tile_loadd that reads it. amx_gemm.c carries an asm
     // barrier for that, but -O2 is the belt to its braces.

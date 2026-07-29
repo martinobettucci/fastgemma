@@ -56,8 +56,13 @@ def sha256(path, limit=None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", required=True, help="e.g. P2Enjoy/fastgemma-gemma-4-E2B")
-    ap.add_argument("--weights", nargs="+", default=["/home/user/models/g4e2b-dual.fgm"])
+    ap.add_argument("--weights", nargs="*", default=["/home/user/models/g4e2b-dual.fgm"],
+                    help="pass with no values to publish extras or the card alone")
     ap.add_argument("--card", default=str(ROOT / "publish" / "MODEL_CARD.md"))
+    ap.add_argument("--extras", nargs="*", default=[],
+                    help="additional files to publish alongside the weights, "
+                         "e.g. the checkpoint's tokenizer.json -- fgm-serve "
+                         "fetches it from here so a first launch needs one repo")
     ap.add_argument("--private", action="store_true", help="create the repo private")
     ap.add_argument("--card-only", action="store_true",
                     help="push only the model card; the weights on the repo are unchanged")
@@ -72,10 +77,10 @@ def main():
         sys.exit("model card does not carry the Gemma Terms of Use -- refusing to upload")
 
     files = []
-    for w in ([] if a.card_only else a.weights):
+    for w in ([] if a.card_only else list(a.weights) + list(a.extras)):
         p = pathlib.Path(w)
         if not p.exists():
-            sys.exit(f"missing weight file: {p}")
+            sys.exit(f"missing file: {p}")
         files.append(p)
 
     print(f"repo    {a.repo}  ({'private' if a.private else 'public'})")

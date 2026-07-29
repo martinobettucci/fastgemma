@@ -1,224 +1,207 @@
 # fastgemma
 
-An attempt to write a super fast CPU-only **Gemma 4** inference server.
+A CPU-only inference engine for **Gemma 4**, written in Rust and C around Intel
+**AMX INT8** tile units, with an **AVX-512 VNNI** path for hosts without them.
 
-Built for one specific serving profile:
+Weights, benchmarks and accuracy numbers live with the model:
 
-> 8 concurrent requests · ~8k prompt tokens in · ~2k tokens out ·
-> ~12 tools × 4 parameters per request · tool-call exactness weighted equally
-> with speed.
+### → **[P2Enjoy/fastgemma-gemma-4-E2B](https://huggingface.co/P2Enjoy/fastgemma-gemma-4-E2B)**
 
-Everything here is measured on the target machine, not extrapolated. Numbers in
-commit messages are reproducible with the harnesses under `bench/`.
+This repository is the engine. Below is how to build it and run it, and how to
+tell in advance whether it will run on your machine at all.
 
-## Target machine
+---
 
-Intel Xeon (Sapphire Rapids class), 4 cores @ 2.1 GHz, 15 GB RAM.
-Measured ceilings (`bench/roofline`):
+## Will it run here?
 
-| | measured |
+Two hard requirements. Check both before building — the failure modes are a
+compile error and a `SIGILL` respectively, and neither says what is wrong.
+
+**1. x86-64 with AVX-512 and VNNI.**
+
+```sh
+grep -o -m1 'avx512f\|avx512_vnni' /proc/cpuinfo | sort -u
+```
+
+You need **both** lines. That is Skylake-SP-with-VNNI, Cascade Lake, Ice Lake,
+Sapphire Rapids or newer. There is no AVX2, NEON or SVE fallback: the attention
+kernels are written in 512-bit intrinsics throughout and the weight format is a
+VNNI operand layout on disk. `fgm-serve` refuses to start with a message naming
+what is missing rather than faulting inside a GEMM.
+
+**2. AMX INT8, if you want the fast path.**
+
+```sh
+grep -o -m1 'amx_tile\|amx_int8' /proc/cpuinfo | sort -u
+```
+
+Optional. With it the engine runs the tile GEMM; without it, the VNNI GEMM.
+Same weights file, chosen from CPUID at startup, printed on the first line of
+output. AMX INT8 measures **12.7× AVX-512 VNNI** on the same silicon, so expect
+prefill to fall by roughly half without it — decode much less, being
+memory-bound rather than multiply-bound.
+
+Under a hypervisor, `/proc/cpuinfo` can advertise AMX while the kernel refuses
+the `XTILEDATA` grant. The engine checks CPUID *and* the grant, and falls back
+rather than trusting either alone.
+
+**Toolchain:** Rust 1.70+ and a C compiler that knows `-march=sapphirerapids`
+(GCC 11+ or Clang 13+). The compiler only has to *know* the target; it does not
+have to be running on one. The dependency tree is `serde`, `serde_json`,
+`memmap2` and `cc` — no async runtime, no web framework, no HTTP client, no
+tokenizer library.
+
+**Memory:** the E2B weights are 4.34 GB, mapped rather than read, so ~6 GB of
+RAM is comfortable and less will work at the cost of page faults.
+
+---
+
+## Build
+
+```sh
+git clone https://github.com/martinobettucci/fastgemma && cd fastgemma
+cargo build --release
+```
+
+Three binaries land in `target/release/`:
+
+| | |
 |---|---|
-| AMX INT8 (`TDPBSSD`) | **14.69 TOPS** |
-| AMX BF16 | 7.00 TFLOPS |
-| AVX512-VNNI | 1.16 TOPS |
-| L1 read | 393 GB/s |
-| L2 read | 209 GB/s |
-| L3 read (260 MB) | 58 GB/s |
-| DRAM read | 33 GB/s |
+| `fgm-serve` | the inference server — start here |
+| `fgm-bench` | benchmark and evaluation driver |
+| `fgm-tokcheck` | tokenizer differ, used by `bench/eval/tokenizer_check.py` |
 
-**AMX is 12.7× AVX512-VNNI.** llama.cpp and ONNX Runtime's CPU paths are
-VNNI/AVX2-based; the AMX tile units are the headroom this project goes after.
+## Run
 
-AMX operand residency matters more than anything else — one 2×2 k-step
-(4 `tile_loadd` + 4 `tile_dpbssd`), per `bench/kernels`:
+```sh
+./target/release/fgm-serve
+```
 
-| operands in | cycles / k-step | TOPS (1 thread) |
-|---|---|---|
-| registers (no loads) | 69 | 3.99 |
-| L1 | 67 | 4.09 |
-| L2 | 93 | 2.96 |
-| L3 | 332 | 0.83 |
-| DRAM | 388 | 0.71 |
+First launch downloads `g4e2b-dual.fgm` (4.34 GB) and `tokenizer.json` from the
+Hugging Face repo above into `~/.cache/fastgemma`, then listens on
+`127.0.0.1:8080`. Interrupted downloads resume; a partial file is never
+renamed into place, so a truncated 4 GB transfer cannot mmap cleanly and
+produce nonsense.
 
-Tile loads are effectively free out of L1 and catastrophic out of L3. Blocking
-for L1/L2 residency is the whole game.
+```sh
+curl localhost:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt": "The capital of France is", "max_tokens": 16}'
+```
 
-## What Gemma 4 E2B actually is
+```json
+{"choices":[{"text":" Paris.","index":0,"finish_reason":"stop"}],
+ "usage":{"prompt_tokens":6,"completion_tokens":5,"total_tokens":11}}
+```
 
-Read off the checkpoint, not the model card:
+### Options
 
-- 35 layers, hidden 1536, MQA with **1 KV head**, `head_dim` 256 on sliding
-  layers but **512 on full-attention** layers, layer pattern `ssssF`×7.
-- **20 of 35 layers share KV** and carry *no* k/v projection weights — the
-  checkpoint ships them but `transformers` lists them in
-  `_keys_to_ignore_on_load_unexpected`. We drop them.
-- Those same 20 layers get a **double-wide MLP** (12288 vs 6144).
-- Only layers 0–14 store KV, and only 4 of those need full length. Measured at
-  10k context: **40 MB/seq, 320 MB for all 8 concurrent requests**, where a naive
-  all-layers-full-length engine would need ~1.8 GB.
-- Per-Layer Embeddings are a 262144 × 8960 lookup table — 2.35 B parameters,
-  *larger than the entire compute network* (1.86 B), but pure gather.
-- Full-attention layers use `proportional` RoPE with `partial_rotary_factor`
-  0.25, so only 128 of 512 head dims rotate.
+```
+--model FILE       .fgm weights (default: downloaded on first launch)
+--tokenizer FILE   tokenizer.json (same)
+--addr HOST:PORT   listen address (default 127.0.0.1:8080)
+--threads N        worker threads (default: all cores)
+--ctx N            max context in tokens (default 8192)
+--no-download      fail instead of fetching anything
+```
 
-E4B differs: hidden 2560, 42 layers, 2 KV heads, 18 shared layers, no double-wide
-MLP.
+| environment | |
+|---|---|
+| `FGM_HOME` | where downloaded files live |
+| `FGM_HF_ENDPOINT` | Hugging Face mirror |
+| `HF_TOKEN` | only for a gated or private mirror |
+| `FGM_BACKEND` | `amx`\|`vnni`, overrides the CPUID choice |
+| `FGM_WEIGHTS` | `int4`\|`int8`\|`auto:M` (default `auto:16`) |
+
+### The API
+
+`POST /v1/completions`, OpenAI-shaped, with `stream` supported via SSE. Also
+`GET /v1/models` and `GET /health`.
+
+**Text completions only.** No `/v1/chat/completions`: that would mean owning a
+chat template, and getting Gemma 4's wrong is a silent accuracy loss rather than
+an error. Send the formatted prompt yourself.
+
+Requests are served **one at a time**. The engine owns a thread pool sized to
+the machine; accepting concurrently would contend for the same cores and make
+every request slower. Batched multi-sequence decode exists in the engine and is
+exercised by `fgm-bench serve` — it is not wired into the HTTP path yet.
+
+These are rejected rather than ignored, because silently downgrading a request
+returns wrong results instead of degraded ones:
+
+```
+n > 1 · temperature ≠ 0 · top_p ≠ 1 · logprobs · echo · best_of
+suffix · logit_bias · token-id array as `prompt`
+```
+
+Sampling is greedy. `stop` (string or array) and `max_tokens` work.
+
+## Benchmarks and evaluation
+
+`fgm-bench` drives everything measured on this project:
+
+```sh
+./target/release/fgm-bench sweep  model.fgm      # prefill/decode vs shape
+./target/release/fgm-bench matrix model.fgm      # (prompt x output) grid
+./target/release/fgm-bench serve  model.fgm      # concurrency, KV, TTFT
+./target/release/fgm-bench tools  model.fgm      # constrained tool calling
+
+bash bench/run_eval.sh                           # behavioural acceptance gate
+bash bench/ab_llamacpp.sh                        # vs llama.cpp, AMX host
+bash bench/ab_llamacpp_vnni.sh                   # vs llama.cpp, AVX-512 host
+python3 bench/eval/tokenizer_check.py            # tokenizer vs HF `tokenizers`
+```
+
+`fgm-bench` refuses to run when another benchmark is on the box or the load
+average is high — contention has silently corrupted measurements on this
+project five times. `FGM_IGNORE_LOAD=1` overrides it.
+
+Kernel-level harnesses build standalone:
+
+```sh
+gcc -O2 -march=cascadelake -fno-strict-aliasing bench/kernels/vnni_test.c \
+    crates/fgm-kernels/csrc/vnni_gemm.c crates/fgm-kernels/csrc/ops.c \
+    -o bench/kernels/vnni_test -lm && ./bench/kernels/vnni_test bench
+
+gcc -O2 -march=sapphirerapids -mamx-int8 -mamx-bf16 -mamx-tile \
+    -o bench/roofline/roofline bench/roofline/roofline.c -lpthread && \
+    ./bench/roofline/roofline 4
+```
+
+## Converting your own weights
+
+```sh
+python3 convert/convert_gemma4.py --src <hf-checkpoint-dir> --out model.fgm \
+        --weights both --group 256
+```
+
+`--weights both` writes int8 twins of the FFN weights alongside the int4 ones
+(+1.56 GB), which is what lets the runtime pick int8 for prefill and int4 for
+decode. `--group` is the int4 group size, a measured speed/accuracy dial.
 
 ## Layout
 
 ```
-convert/                   safetensors -> .fgm (quantise, rotate, AMX tile-pack)
-crates/fgm-kernels/csrc/   AMX INT8 GEMM
-bench/roofline/            hardware ceiling probe
-bench/kernels/             GEMM correctness + throughput sweeps
+crates/fgm-kernels/csrc/amx_gemm.c    AMX INT8 GEMM (tile path)
+crates/fgm-kernels/csrc/vnni_gemm.c   AVX-512 VNNI GEMM (fallback path)
+crates/fgm-kernels/csrc/ops.c         attention, norms, RoPE, quant, gathers
+crates/fgm-core/                      forward pass, KV cache, worker pool, grammar
+crates/fgm-serve/                     HTTP server, tokenizer, HF download
+crates/fgm-bench/                     benchmark and evaluation driver
+convert/                              safetensors -> .fgm
+bench/                                roofline, kernel harnesses, eval gate
 ```
 
-## Quantisation
+## JOURNAL.md
 
-| tensor class | format | why |
-|---|---|---|
-| FFN gate/up/down | int4, group 256 | 84% of compute params; decode is DRAM-bound |
-| attention q/k/v/o | int8 per-channel | small, and accuracy-critical |
-| embed / LM head | int4, group 256 | 403 M params |
-| PLE table | int4, group 64 | 2.35 B params, pure gather; no AMX drain so 64 is free |
-| norms, scalars | f32 | negligible |
+The running log: every experiment, every number, and every trap that cost time —
+including the ones where the measurement was wrong rather than the code. If you
+are wondering why something is built the way it is, the answer is usually there
+with the measurement that forced it.
 
-Group size is a measured dial, not a guess — it sets how often the int4 kernel
-must drain its int32 accumulator (`--group`):
+## Licence
 
-| group | weight rel err | prefill 512 | decode |
-|---|---|---|---|
-| 64 | 0.0902 | 101.2 tok/s | 12.7 tok/s |
-| 256 | 0.1016 | **131.9 tok/s** | **14.5 tok/s** |
-
-Every linear weight is **Hadamard-rotated along K** (`rotconv`). H is orthogonal,
-so `W' = W Hᵀ` plus a runtime fast Walsh-Hadamard transform of the activation is
-mathematically identical, but both weight groups and activation rows lose their
-outliers. Measured on outlier-heavy weights this takes int4 relative error from
-**0.194 → 0.078**. Runtime cost is a 128-point FWHT (~10 K ops/token) against an
-18.9 M-op GEMM.
-
-int4 scales use all 16 levels (Q4_0 convention: the extreme element maps onto −8)
-refined by a per-group MSE search over shrink factors — conversion-time only, no
-runtime change. Gaussian relative error 0.107 → 0.0906.
-
-E2B converts to **2.78 GB** in ~1070 s; measured int4 FFN relative error ≈ 0.102
-at group 256, 0.090 at group 64.
-
-## Kernel notes
-
-B is pre-packed by the converter into AMX tile order (`[n_block][k_block]`, each
-tile 16 rows × 64 B holding `(K=64, N=16)` as `[k/4][n][k%4]` — the VNNI layout
-`_tile_dpbssd` consumes), so the runtime mmaps and executes with zero repacking.
-A is packed at call time into contiguous tiles: loading a 16×64 tile straight out
-of row-major `A[M,K]` means 16 cache lines K bytes apart, and those stalls cost
-more than the `dpbssd` they feed.
-
-int4 group scales force an int32→f32 drain every `group/64` tile steps. The drain
-is O(MR·NR) while the AMX work it amortises is O(MR·NR·group), so group size is a
-direct speed/accuracy dial — `bench/kernels/gemm_bench` sweeps it.
-
-> **`unpack_tile` contains a load-bearing `asm volatile` memory barrier.**
-> `_tile_loadd` is opaque to GCC's alias analysis, so at `-O3` it sinks or
-> eliminates the AVX stores that fill the unpack buffer. Without the barrier the
-> int4 path silently returns garbage at `-O3` while passing at `-O2`. Both paths
-> are verified against scalar references over a 19-shape sweep.
-
-## Reproducing
-
-```sh
-gcc -O2 -march=sapphirerapids -mamx-int8 -mamx-bf16 -mamx-tile \
-    -o bench/roofline/roofline bench/roofline/roofline.c -lpthread && \
-    ./bench/roofline/roofline 4
-
-gcc -O3 -march=sapphirerapids -mamx-int8 -mamx-tile -mavx512fp16 \
-    -o bench/kernels/gemm_bench bench/kernels/gemm_bench.c \
-    crates/fgm-kernels/csrc/amx_gemm.c -lpthread -lm && \
-    ./bench/kernels/gemm_bench 4 6144 1536
-
-python3 convert/convert_gemma4.py --src <hf-dir> --out model.fgm
-```
-
-## vs llama.cpp (same box, same model, same bit width)
-
-Baseline is `google/gemma-4-E2B-it-qat-q4_0-gguf` — Google's own QAT Q4_0 GGUF —
-on llama.cpp build 91f8c9c with `GGML_NATIVE=ON`, 4 threads, idle machine.
-
-**Decode, aggregate tok/s, 512-token prompts:**
-
-| concurrency | fastgemma | llama.cpp | |
-|---|---|---|---|
-| 1 | 15.0 | **19.5** | llama +30% |
-| 4 | **46.7** | 40.1 | **fastgemma +16%** |
-| 8 | **67.3** | 59.7 | **fastgemma +13%** |
-
-**Prefill, tok/s:**
-
-| tokens | fastgemma | llama.cpp | |
-|---|---|---|---|
-| 128 | **168.9** | 163.4 | fastgemma +3% |
-| 256 | **164.5** | 161.0 | fastgemma +2% |
-| 512 | 142.9 | **158.5** | llama +11% |
-
-At the concurrency this project was briefed for — 8 requests — fastgemma is
-**13% faster on decode**. It is *not* faster single-stream: at M=1 decode is pure
-memory bandwidth and AMX has nothing to work with, while llama.cpp's Q4_0 kernels
-are extremely well tuned. The advantage appears exactly when requests batch and
-one weight read serves 8 rows. Long prefill still favours llama.cpp because our
-attention kernel is naive and O(M²) — that is the next fix, not a ceiling.
-
-## Results so far (E2B, 4 threads, int4 group 256)
-
-Prefill, single sequence:
-
-| tokens | tok/s |
-|---|---|
-| 128 | 168.9 |
-| 256 | **164.5** |
-| 512 | 142.9 |
-
-Decode:
-
-| | tok/s |
-|---|---|
-| 1 sequence | 15.3 |
-| 8 concurrent, aggregate | **67.3** (4.5× batching win) |
-
-KV cache at 8 concurrent × 10k context: **320 MB total, 40 MB/seq.**
-
-Accuracy vs `transformers` bf16, deterministic (1-thread) reference, real text:
-
-| metric | value |
-|---|---|
-| greedy agreement | 82.7% |
-| HF's pick in our top-3 | 98.8% |
-| HF's pick in our top-5 | 100.0% |
-| mean cosine | 0.99901 |
-| median top1–top2 gap | 3.79 overall, **1.04 where we disagree** |
-
-Disagreements sit almost entirely on near-ties — the signature of int4 weight
-error, not a structural fault. Layer-by-layer the engine tracks HF at cos > 0.99
-through layer 33.
-
-> The reference **must** be run single-threaded. torch's multithreaded bf16 path
-> is non-deterministic on this model: HF agrees with itself on only 86.4% of
-> positions at 4 threads (max logit diff 10.7) versus 100.0% at 1 thread.
-> Grading against the 4-thread "noise floor" would have flattered this engine by
-> ~15 points.
-
-Constrained tool calling, 12 tools × 4 params on the real 262144-token vocab:
-1011 DFA states, 3.4 s one-time compile, 33.1 MB of mask, output parses with the
-right tool and all args. **36% of decode steps admit exactly one token** — those
-can skip the 201 MB int4 LM-head read entirely.
-
-## Status
-
-Done and measured: hardware roofline, AMX INT8 kernels, quantizing converter,
-validated Gemma 4 forward pass, worker pool, batched decode, int4 group-size
-A/B, constrained tool-call decoding, accuracy harness.
-
-Not done yet: llama.cpp / ONNX Runtime baselines on this box, E4B conversion,
-prefix radix cache for the shared tool-definition prefix, K-blocking for
-L1-resident AMX operands (the largest known remaining kernel win), and
-speculative multi-token prediction. See `JOURNAL.md` for the running log,
-including the traps that cost the most time.
+The engine is in this repository under its own licence. The **weights** are a
+derivative of `google/gemma-4-E2B-it` and are governed by the
+[Gemma Terms of Use](https://ai.google.dev/gemma/terms); see the model repo.
