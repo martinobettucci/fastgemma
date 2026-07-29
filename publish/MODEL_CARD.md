@@ -84,28 +84,22 @@ no AMX), 4 cores @ 2.8 GHz, 16 GB RAM, 1 MB L2 per core.
 
 ## Measured performance
 
-All figures on an idle machine, 4 threads. Single-sequence, median of 5 runs
-with the full range in brackets — the run-to-run noise floor on this box is
-4.7% on prefill and 4.4% on decode, so ranges are quoted rather than points.
+Idle machine, 4 threads, single sequence, ranges in brackets. AMX figures are
+median of 5 (run-to-run noise floor on that host: 4.7% prefill, 4.4% decode);
+AVX-512 figures are median of 3 with arms alternated within each pass.
 
-There is also an int4 **group-512** build (`g4e2b-g512.fgm`, 2.77 GB) giving
-+7.6% prefill. It is shipped conditionally: unconstrained tool calling drops to
-24/25 on the eval below, while grammar-constrained decoding restores 25/25. Use
-it only when tool calls are constrained.
+**Never compare a number in one table against a number in the other** — they
+are different machines at different clocks. The backend comparison that *is*
+meaningful is llama.cpp on each host, below.
 
-**Prefill, tok/s** (int8 weights, selected automatically for ≥16 rows):
+### On AMX
 
-| prompt | tok/s |
-|---|---|
-| 1024 | **280.3** [240–284] |
-| 8192 | **168.5** [160–170] |
+| prompt | prefill tok/s | | context | decode tok/s |
+|---|---|---|---|---|
+| 1024 | **280.3** [240–284] | | 1024 | **14.2** [14.0–15.0] |
+| 8192 | **168.5** [160–170] | | 8192 | **13.8** [13.1–14.5] |
 
-**Decode, tok/s** (int4 weights, selected automatically below 16 rows):
-
-| context | tok/s |
-|---|---|
-| 1024 | **14.2** [14.0–15.0] |
-| 8192 | **13.8** [13.1–14.5] |
+Prefill uses int8 weights (selected automatically at ≥16 rows), decode int4.
 
 **Target serving profile — 8 concurrent, 8192 in / 2048 out**, with a
 2048-token shared tool-declaration prefix:
@@ -119,6 +113,27 @@ it only when tool calls are constrained.
 
 Decode is measured over 352 steps and extrapolated to 2048; the rate is
 measured, the total is arithmetic.
+
+### On AVX-512 VNNI
+
+| prompt | prefill tok/s | | context | decode tok/s |
+|---|---|---|---|---|
+| 512 | **124.6** [121.9–128.7] | | 512 | 7.4 |
+| 2048 | **113.9** [106.1–115.9] | | 8192 | 6.6 [6.2–6.8] |
+| 8192 | **77.6** [77.5–81.5] | | | |
+
+Decode here is raw single-stream. On the grammar-constrained tool-calling
+workload the two speculative paths take it to **9.19 tok/s** [9.08–9.22] from a
+7.87 baseline, +16.8%, with byte-identical output — see the speculative
+decoding table below.
+
+The prefill fall-off from 512 to 8192 is steeper than on AMX because attention
+grows as a share of a phase whose GEMM is already eight times slower.
+
+There is also an int4 **group-512** build (`g4e2b-g512.fgm`, 2.77 GB) giving
++7.6% prefill on AMX. It is shipped conditionally: unconstrained tool calling
+drops to 24/25 on the eval below, while grammar-constrained decoding restores
+25/25. Use it only when tool calls are constrained.
 
 ## vs llama.cpp
 
@@ -195,8 +210,9 @@ Three caveats that belong with these numbers, not under them:
 
 ## Why AMX for GEMM but not for attention
 
-AMX INT8 is 12.7× AVX512-VNNI on this box (14.69 vs 1.16 TOPS), and the engine
-uses it for every weight GEMM. It is deliberately **not** used for attention,
+AMX INT8 is 12.7× AVX512-VNNI on the same silicon (14.69 vs 1.16 TOPS
+measured), and the engine uses it for every weight GEMM where it exists. It is
+deliberately **not** used for attention,
 and the reason is arithmetic intensity rather than any property of the
 instruction:
 
@@ -211,6 +227,10 @@ at 18–41 G MAC/s — that is 3–7% of the VNNI ceiling it already has, i.e. t
 multiplier is 93–97% idle. Making an idle multiplier 12.7× faster buys nothing.
 A weight GEMM reuses each byte across all M rows, which is why the same
 instruction is transformative there.
+
+This is also why the attention kernels are shared verbatim between the two
+backends: they were always pure AVX-512/VNNI, and there was never an AMX
+version of them to fall back from.
 
 ## Accuracy
 
@@ -230,6 +250,14 @@ Gemma 4's native declaration format:
 
 **Long-context retention** — a fact planted at seven depths in an 8184-token
 context and asked for at the end: **7/7**, depths 0.02 through 0.98.
+
+**Both backends score identically**, which is the point rather than a
+coincidence: they consume the same weight bytes and differ only in which
+multiply instruction runs, so a divergence here would mean a kernel bug, not a
+precision trade. The first run of this gate on the AVX-512 backend found
+exactly that — the int4 nibble was being decoded with the wrong sign
+convention, output was noise, and the GEMM unit test had reported a
+bit-identical match because its reference made the same assumption.
 
 Caveat worth stating: 25/25 has wide bounds. A regression to 95% accuracy would
 still read 25/25 about 28% of the time. This is a floor that detects breakage,
@@ -260,7 +288,8 @@ huggingface-cli download P2Enjoy/fastgemma-gemma-4-E2B g4e2b-dual.fgm --local-di
 
 `FGM_WEIGHTS=int4|int8|auto:M` selects the quantisation (default `auto:16`, the
 AMX tile height — below 16 rows a GEMM cannot fill one tile of rows, so it is
-decode-shaped whatever the caller calls it).
+decode-shaped whatever the caller calls it). `FGM_BACKEND=amx|vnni` overrides
+the CPUID choice of GEMM kernel.
 
 ## What was tried and rejected
 
@@ -275,22 +304,29 @@ because two of these look attractive on paper:
 | **int4 group 512** | Conditionally accepted, +7.6% prefill. Ships only with constrained decoding. |
 
 A **head-batched** attention kernel (one K line serving all 8 query heads,
-raising intensity from 1 to 8 MACs/byte) measures **2.59× on Q·Kᵀ alone** at
-head_dim 512 / ctx 8192, with a crossover exactly on the 2 MB L2 line. It is
-integrated but **not yet verified end to end** — the benchmark host lost its
-AMX units before that could be measured, so it is not reflected in any number
-on this card.
+raising arithmetic intensity from 1 to 8 MACs/byte) measures **2.59× on Q·Kᵀ
+alone** at head_dim 512 / ctx 8192. It ships behind a shape rule: use it only
+when one layer's K working set exceeds the per-core L2, which is read from the
+machine rather than assumed. End to end at 8192 on the AVX-512 reference it is
+**neutral** — attention is a small share of a prefill where the VNNI GEMM
+already accounts for 62–67% of the time, so a 2.59× on part of the remainder
+does not survive the dilution. Forcing it on everywhere buys ~2% prefill and
+costs ~8% decode, which is the rule earning its keep: a sliding layer decodes
+against a 512-position window, 128 KB of K, nowhere near any L2.
 
 ## Known limitations
 
-- **AMX required.** No AVX-512-only or ARM fallback.
+- **x86-64 only.** AVX-512 with VNNI is the floor; there is no AVX2, NEON or
+  ARM SVE path. Without AMX, expect roughly half the prefill throughput.
 - **TTFT scales with concurrency.** Prefill is sequential per sequence, so the
   eighth of eight requests waits 342 s while the first waits 70 s. Aggregate
   throughput is unaffected; interleaving prefill across sequences would flatten
   this and is not yet implemented.
-- **Tile-state defect on some hosts.** This reference machine loses AMX tile
-  state across context switches (5–8 of 12 warm-up trials corrupted, varying by
-  run). The engine detects this at startup and enables a sentinel-based
-  detect-and-retry guard costing 1–2%. Correctness is unaffected; throughput on
-  such hosts varies by up to 25% run to run.
+- **Tile-state defect on some virtualised hosts.** Some hypervisors do not
+  preserve AMX tile state across a context switch: tiles come back zeroed and an
+  accumulator held across a k-loop silently loses everything summed before the
+  switch. The engine probes for this at startup and, where it finds it, enables
+  a sentinel-based detect-and-retry guard costing 1–2%. Correctness is
+  unaffected; throughput on such hosts varies by up to 25% run to run. The
+  AVX-512 backend has no tile state and is not exposed to this.
 - E4B is not converted.
