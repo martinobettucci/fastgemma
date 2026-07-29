@@ -2151,3 +2151,59 @@ front of it.
 And once more, from the same family as Traps 12 and 19: `pkill -f "fgm-serve
 --model"` matched the A/B script's own command line and killed the harness
 mid-run. Third self-matching process match in this project. `pkill -x`.
+
+---
+
+## 34. Server vs bench at the briefed shape, and a bench that flattered itself
+
+"How much difference between the bench and the server for 8192 in / 2048 out?"
+— the only shape this project was ever briefed for, and the one I had not
+measured the server at. 8 concurrent, AVX-512 backend, 4 threads, no prefix
+sharing on either side.
+
+| | `fgm-bench serve` | `fgm-serve` |
+|---|---|---|
+| prefill | 681.6 s → 96.1 tok/s agg | 672.1 s → 97.5 tok/s agg |
+| decode | 781.5 s → 21.0 tok/s agg (381.6 ms/step) | 822.1 s → 19.9 tok/s agg (401.4 ms/step) |
+| **total** | **1463.1 s** | **1494.2 s** |
+
+**2.1% apart, which is inside this box's 4.4% decode noise floor.** The right
+statement is "no measurable difference", not "2% slower". Prefill is a dead
+heat because it is the same code on the same path: sequential, chunked at 256,
+one sequence at a time in both.
+
+The server generated all 16384 tokens; nothing stopped early.
+
+### The bench was flattering itself by 10%
+
+The first attempt at this comparison had the bench at 1323 s against the
+server's 1494 s — a 13% gap that looked like server overhead. It was not. The
+bench caps decode at 60 s and **extrapolates**, and that extrapolation measured
+the first 189 of 2048 steps, at the shortest context those steps will ever
+have. Attention cost grows with context, so the early steps are the fastest
+ones the run contains:
+
+    first 189 steps   317.5 ms/step   ->  650 s extrapolated
+    all 2048 steps    381.6 ms/step   ->  781 s measured
+
+**The extrapolation was 9.6% optimistic**, and every serving number quoted from
+this mode has carried that. `FGM_DECODE_CAP` now makes the cap settable so the
+full run can be measured; the default stays 60 s because a 25-minute benchmark
+that nobody runs is worse than a fast one with a documented bias.
+
+**Trap 28 — an extrapolation from the first N of M steps is not an estimate, it
+is a bound.** Anything whose cost grows with position — attention over a
+lengthening context being the obvious one — makes the measured prefix the
+cheapest part of the run by construction. The error is one-signed and it always
+points the flattering way. It is the same shape as Trap 22: the instrument
+reported something true and the thing I wanted was different.
+
+### What is left in the 5% decode gap
+
+The server does per-step work the bench does not: it detokenises the whole
+emitted run each step (O(n) per step, so O(n²) over a 2048-token generation),
+scans for stop strings, computes a UTF-8-stable prefix, and pushes a channel
+message per slot per step. Arithmetic puts all of that under a second across
+the whole run, against a 40 s difference — so it does not explain the gap and
+the gap is not distinguishable from noise anyway. Not optimising something that
+has not been measured to matter.

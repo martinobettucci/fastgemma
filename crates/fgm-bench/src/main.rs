@@ -316,6 +316,7 @@ fn main() {
             let pin: usize = std::env::var("FGM_IN").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
             let pout: usize = std::env::var("FGM_OUT").ok().and_then(|v| v.parse().ok()).unwrap_or(2048);
             let chunk: usize = std::env::var("FGM_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+            let dec_cap: f64 = std::env::var("FGM_DECODE_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(60.0);
             let ctx = pin + pout + 8;
             println!("\n== serve: {conc} concurrent, {pin} in / {pout} out, prefill chunk {chunk} ==");
 
@@ -391,7 +392,13 @@ fn main() {
                     toks[s] = argmax(&lg[s * cfg.vocab_size..(s + 1) * cfg.vocab_size]) as u32;
                 }
                 steps += 1;
-                if t_dec.elapsed().as_secs_f64() > 60.0 {
+                // Cap the decode so a full 2048-step run does not take 20
+                // minutes on every invocation -- but make it settable, because
+                // the extrapolation this produces is systematically optimistic:
+                // it measures the FIRST steps, at the shortest context those
+                // steps will ever have, and attention cost grows with context.
+                // FGM_DECODE_CAP=1e9 runs the whole thing.
+                if t_dec.elapsed().as_secs_f64() > dec_cap {
                     break;
                 }
             }
