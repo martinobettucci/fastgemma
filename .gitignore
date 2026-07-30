@@ -85,3 +85,6 @@ bench/eval/.retention.json
 *.fgm
 __pycache__/
 target/
+
+# Local work summary, kept out of history on purpose (hand-off doc, not source)
+SUMMARY.md
