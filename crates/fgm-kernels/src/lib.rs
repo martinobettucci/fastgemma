@@ -1,0 +1,530 @@
+//! FFI to the AMX / AVX-512 kernels in `csrc/`.
+//!
+//! Every function here is a thin `unsafe extern "C"` binding plus a safe
+//! wrapper that asserts the shape invariants the C side assumes (K a multiple
+//! of 64, N-block ranges a multiple of 4, A pre-packed into tiles).
+
+use std::sync::Once;
+
+#[allow(non_camel_case_types)]
+pub type f16 = u16;
+
+
+extern "C" {
+    fn fgm_amx_init() -> i32;
+    fn fgm_tile_probe(trials: i32, sleep_us: i64) -> i32;
+    fn fgm_tile_guard_set(on: i32);
+    fn fgm_tile_retry_count() -> i64;
+    fn fgm_tile_retry_reset();
+    fn fgm_pack_a(m: i32, k: i32, a: *const i8, ap: *mut i8);
+    fn fgm_prep_rows(
+        src: *const f32, lda: i32, rot: *mut f32, qa: *mut i8, qs: *mut f32,
+        pa: *mut i8, m: i32, k: i32, hsz: i32, r0: i32, r1: i32,
+    );
+    fn fgm_gemm_q4g(
+        m: i32, n: i32, k: i32, a: *const i8, a_scale: *const f32,
+        bq: *const u8, b_scale: *const f16, group: i32,
+        c: *mut f32, ldc: i32, n0: i32, n1: i32,
+    );
+    fn fgm_gemm_q8c(
+        m: i32, n: i32, k: i32, a: *const i8, a_scale: *const f32,
+        b: *const i8, b_scale: *const f32,
+        c: *mut f32, ldc: i32, n0: i32, n1: i32,
+    );
+    fn fgm_cpu_has_amx() -> i32;
+    fn fgm_cpu_has_avx512_vnni() -> i32;
+    fn fgm_gemm_q4g_vnni(
+        m: i32, n: i32, k: i32, a: *const i8, a_scale: *const f32,
+        bq: *const u8, b_scale: *const f16, group: i32,
+        c: *mut f32, ldc: i32, n0: i32, n1: i32,
+    );
+    fn fgm_gemm_q8c_vnni(
+        m: i32, n: i32, k: i32, a: *const i8, a_scale: *const f32,
+        b: *const i8, b_scale: *const f32,
+        c: *mut f32, ldc: i32, n0: i32, n1: i32,
+    );
+
+    fn fgm_rmsnorm(out: *mut f32, x: *const f32, w: *const f32, n: i32, eps: f32);
+    fn fgm_rmsnorm_noscale(out: *mut f32, x: *const f32, n: i32, eps: f32);
+    fn fgm_gelu_mul(out: *mut f32, gate: *const f32, up: *const f32, n: i32);
+    fn fgm_gelu(x: *mut f32, n: i32);
+    fn fgm_rope(x: *mut f32, n_heads: i32, head_dim: i32, inv_freq: *const f32, pos: i32);
+    fn fgm_fwht(x: *mut f32, n: i32, hsz: i32);
+    fn fgm_quant_act(x: *const f32, rows: i32, k: i32, q: *mut i8, scale: *mut f32);
+    fn fgm_gather_q8r(out: *mut f32, tbl: *const i8, sc: *const f32, row: i32, k: i32);
+    fn fgm_gather_q4r(out: *mut f32, tbl: *const u8, sc: *const f16, row: i32, k: i32);
+    fn fgm_add(a: *mut f32, b: *const f32, n: i32);
+    fn fgm_mul(a: *mut f32, b: *const f32, n: i32);
+    fn fgm_scale(a: *mut f32, s: f32, n: i32);
+    fn fgm_softcap(x: *mut f32, n: i32, cap: f32);
+    fn fgm_attend_q8(
+        out: *mut f32, q: *const f32, kc: *const i8, ks: *const f32,
+        vc: *const i8, vs: *const f32, n_heads: i32, kv_heads: i32,
+        head_dim: i32, start: i32, end: i32, scratch: *mut f32,
+    );
+    fn fgm_attend_q8_heads(
+        out: *mut f32, q: *const f32, kc: *const i8, ks: *const f32,
+        vc: *const i8, vs: *const f32, n_heads: i32, kv_heads: i32,
+        head_dim: i32, start: i32, end: i32, scratch: *mut f32,
+        h0: i32, h1: i32, ring: i32, cap: i32,
+    );
+    fn fgm_store_v_t(vt: *mut i8, src: *const i8, n: i32, slot: i32);
+    fn fgm_set_scalar_wfill(on: i32);
+    fn fgm_attend_q8_row(
+        out: *mut f32, q: *const f32, kc: *const i8, ks: *const f32,
+        vc: *const i8, vs: *const f32, n_heads: i32, kv_heads: i32,
+        head_dim: i32, start: i32, end: i32, scratch: *mut f32,
+        ring: i32, cap: i32,
+    );
+    fn fgm_rowbatch_scratch(n_heads: i32, cap: i32, head_dim: i32) -> i32;
+}
+
+static AMX: Once = Once::new();
+
+/// Which GEMM kernel the process will use.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Backend {
+    /// AMX INT8 tiles — 14.7 TOPS measured ceiling.
+    Amx,
+    /// AVX-512 VNNI — 1.16 TOPS measured ceiling. Same weights, same layout.
+    Vnni,
+}
+
+impl Backend {
+    pub fn name(self) -> &'static str {
+        match self {
+            Backend::Amx => "amx",
+            Backend::Vnni => "avx512-vnni",
+        }
+    }
+}
+
+/// The GEMM backend for this host, decided once and cached.
+///
+/// The decision is made from CPUID, not from whether `fgm_amx_init` succeeded:
+/// the tile-permission syscall is per-thread and returns ENOTSUP on a CPU with
+/// no tile registers, but by the time you learn that you may already have
+/// executed a tile instruction and taken SIGILL. CPUID answers before anything
+/// runs.
+///
+/// `FGM_BACKEND=amx|vnni` forces it, which is the only way to A/B the two
+/// paths on a host that has both.
+pub fn backend() -> Backend {
+    use std::sync::OnceLock;
+    static B: OnceLock<Backend> = OnceLock::new();
+    *B.get_or_init(|| {
+        let has_amx = unsafe { fgm_cpu_has_amx() != 0 };
+        match std::env::var("FGM_BACKEND").as_deref() {
+            Ok("vnni") => Backend::Vnni,
+            Ok("amx") => {
+                assert!(has_amx, "FGM_BACKEND=amx but this CPU has no AMX");
+                Backend::Amx
+            }
+            _ => {
+                if has_amx && amx_init() {
+                    Backend::Amx
+                } else {
+                    assert!(
+                        unsafe { fgm_cpu_has_avx512_vnni() != 0 },
+                        "fastgemma needs AVX-512 VNNI at minimum; this CPU has neither \
+                         that nor AMX"
+                    );
+                    Backend::Vnni
+                }
+            }
+        }
+    })
+}
+
+/// Request XTILEDATA from the kernel. Must be called on every thread that runs
+/// AMX instructions, before the first one — the permission is per-thread.
+///
+/// Returns false on a CPU without AMX (the syscall reports ENOTSUP), which is
+/// not an error: it is how [`backend`] learns to use the VNNI path.
+pub fn amx_init() -> bool {
+    let mut ok = true;
+    AMX.call_once(|| {});
+    unsafe {
+        ok &= fgm_amx_init() != 0;
+    }
+    ok
+}
+
+/// Bytes needed for the tile-packed copy of an `m x k` activation matrix.
+#[inline]
+pub fn packed_a_len(m: usize, k: usize) -> usize {
+    m.div_ceil(16) * 16 * k
+}
+
+#[inline]
+pub fn pack_a(m: usize, k: usize, a: &[i8], ap: &mut [i8]) {
+    debug_assert!(k % 64 == 0);
+    debug_assert!(a.len() >= m * k);
+    debug_assert!(ap.len() >= packed_a_len(m, k));
+    unsafe { fgm_pack_a(m as i32, k as i32, a.as_ptr(), ap.as_mut_ptr()) }
+}
+
+/// `C[m, n] = (A int8 * a_scale) . (int4-grouped B * b_scale)`, columns
+/// `[n0*16, n1*16)`. `a` must already be tile-packed via [`pack_a`].
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn gemm_q4g(
+    m: usize, n: usize, k: usize, a: &[i8], a_scale: &[f32],
+    bq: &[u8], b_scale: &[f16], group: usize, c: &mut [f32], ldc: usize,
+    n0: usize, n1: usize,
+) {
+    debug_assert!(k % 64 == 0 && n % 16 == 0);
+    debug_assert!((n1 - n0) % 4 == 0, "n-block range must be a multiple of 4");
+    unsafe {
+        match backend() {
+            Backend::Amx => fgm_gemm_q4g(
+                m as i32, n as i32, k as i32, a.as_ptr(), a_scale.as_ptr(),
+                bq.as_ptr(), b_scale.as_ptr(), group as i32,
+                c.as_mut_ptr(), ldc as i32, n0 as i32, n1 as i32,
+            ),
+            Backend::Vnni => fgm_gemm_q4g_vnni(
+                m as i32, n as i32, k as i32, a.as_ptr(), a_scale.as_ptr(),
+                bq.as_ptr(), b_scale.as_ptr(), group as i32,
+                c.as_mut_ptr(), ldc as i32, n0 as i32, n1 as i32,
+            ),
+        }
+    }
+}
+
+/// `C[m, n] = (A int8 * a_scale) . (int8 per-channel B * b_scale)`.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn gemm_q8c(
+    m: usize, n: usize, k: usize, a: &[i8], a_scale: &[f32],
+    b: &[i8], b_scale: &[f32], c: &mut [f32], ldc: usize, n0: usize, n1: usize,
+) {
+    debug_assert!(k % 64 == 0 && n % 16 == 0);
+    debug_assert!((n1 - n0) % 4 == 0, "n-block range must be a multiple of 4");
+    unsafe {
+        match backend() {
+            Backend::Amx => fgm_gemm_q8c(
+                m as i32, n as i32, k as i32, a.as_ptr(), a_scale.as_ptr(),
+                b.as_ptr(), b_scale.as_ptr(), c.as_mut_ptr(), ldc as i32,
+                n0 as i32, n1 as i32,
+            ),
+            Backend::Vnni => fgm_gemm_q8c_vnni(
+                m as i32, n as i32, k as i32, a.as_ptr(), a_scale.as_ptr(),
+                b.as_ptr(), b_scale.as_ptr(), c.as_mut_ptr(), ldc as i32,
+                n0 as i32, n1 as i32,
+            ),
+        }
+    }
+}
+
+#[inline]
+pub fn rmsnorm(out: &mut [f32], x: &[f32], w: &[f32], eps: f32) {
+    let n = w.len();
+    unsafe { fgm_rmsnorm(out.as_mut_ptr(), x.as_ptr(), w.as_ptr(), n as i32, eps) }
+}
+
+#[inline]
+pub fn rmsnorm_noscale(out: &mut [f32], x: &[f32], n: usize, eps: f32) {
+    unsafe { fgm_rmsnorm_noscale(out.as_mut_ptr(), x.as_ptr(), n as i32, eps) }
+}
+
+#[inline]
+pub fn gelu_mul(out: &mut [f32], gate: &[f32], up: &[f32], n: usize) {
+    unsafe { fgm_gelu_mul(out.as_mut_ptr(), gate.as_ptr(), up.as_ptr(), n as i32) }
+}
+
+#[inline]
+pub fn gelu(x: &mut [f32]) {
+    let n = x.len();
+    unsafe { fgm_gelu(x.as_mut_ptr(), n as i32) }
+}
+
+#[inline]
+pub fn rope(x: &mut [f32], n_heads: usize, head_dim: usize, inv_freq: &[f32], pos: usize) {
+    unsafe { fgm_rope(x.as_mut_ptr(), n_heads as i32, head_dim as i32, inv_freq.as_ptr(), pos as i32) }
+}
+
+/// In-place normalised fast Walsh-Hadamard transform on blocks of `hsz`.
+#[inline]
+pub fn fwht(x: &mut [f32], hsz: usize) {
+    let n = x.len();
+    debug_assert!(n % hsz == 0 && hsz.is_power_of_two());
+    unsafe { fgm_fwht(x.as_mut_ptr(), n as i32, hsz as i32) }
+}
+
+#[inline]
+pub fn quant_act(x: &[f32], rows: usize, k: usize, q: &mut [i8], scale: &mut [f32]) {
+    unsafe { fgm_quant_act(x.as_ptr(), rows as i32, k as i32, q.as_mut_ptr(), scale.as_mut_ptr()) }
+}
+
+#[inline]
+pub fn gather_q8r(out: &mut [f32], tbl: &[i8], sc: &[f32], row: usize, k: usize) {
+    unsafe { fgm_gather_q8r(out.as_mut_ptr(), tbl.as_ptr(), sc.as_ptr(), row as i32, k as i32) }
+}
+
+#[inline]
+pub fn gather_q4r(out: &mut [f32], tbl: &[u8], sc: &[f16], row: usize, k: usize) {
+    unsafe { fgm_gather_q4r(out.as_mut_ptr(), tbl.as_ptr(), sc.as_ptr(), row as i32, k as i32) }
+}
+
+#[inline]
+pub fn add(a: &mut [f32], b: &[f32]) {
+    let n = a.len().min(b.len());
+    unsafe { fgm_add(a.as_mut_ptr(), b.as_ptr(), n as i32) }
+}
+
+#[inline]
+pub fn mul(a: &mut [f32], b: &[f32]) {
+    let n = a.len().min(b.len());
+    unsafe { fgm_mul(a.as_mut_ptr(), b.as_ptr(), n as i32) }
+}
+
+#[inline]
+pub fn scale(a: &mut [f32], s: f32) {
+    let n = a.len();
+    unsafe { fgm_scale(a.as_mut_ptr(), s, n as i32) }
+}
+
+#[inline]
+pub fn softcap(x: &mut [f32], cap: f32) {
+    let n = x.len();
+    unsafe { fgm_softcap(x.as_mut_ptr(), n as i32, cap) }
+}
+
+/// Attention for one query row against an int8 KV cache, positions `[start, end)`.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn attend_q8(
+    out: &mut [f32], q: &[f32], kc: &[i8], ks: &[f32], vc: &[i8], vs: &[f32],
+    n_heads: usize, kv_heads: usize, head_dim: usize, start: usize, end: usize,
+    scratch: &mut [f32],
+) {
+    debug_assert!(scratch.len() >= end - start);
+    unsafe {
+        fgm_attend_q8(
+            out.as_mut_ptr(), q.as_ptr(), kc.as_ptr(), ks.as_ptr(),
+            vc.as_ptr(), vs.as_ptr(), n_heads as i32, kv_heads as i32,
+            head_dim as i32, start as i32, end as i32, scratch.as_mut_ptr(),
+        )
+    }
+}
+
+/// Attention restricted to heads `[h0, h1)`, so the pool can split the work.
+/// `q` and `out` point at the first head in the range, not at head 0.
+///
+/// `ring` is the KV cache capacity for sliding layers stored in a ring buffer
+/// (0 = linear). It MUST match what the write path used, or reads run off the
+/// end of the allocation once the context passes the window.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn attend_q8_heads(
+    out: &mut [f32], q: &[f32], kc: &[i8], ks: &[f32], vc: &[i8], vs: &[f32],
+    n_heads: usize, kv_heads: usize, head_dim: usize, start: usize, end: usize,
+    scratch: &mut [f32], h0: usize, h1: usize, ring: usize, cap: usize,
+) {
+    // Scratch holds the scores, then u8 weights indexed by slot, then int32
+    // accumulators -- all sized off the capacity, since a slot is always < cap
+    // and a score range is never longer than the cache holding it.
+    debug_assert!(scratch.len() >= attend_scratch(cap, head_dim));
+    debug_assert!(ring == 0 || kc.len() >= ring * kv_heads * head_dim);
+    debug_assert!(vc.len() >= cap.div_ceil(4) * 4 * kv_heads * head_dim);
+    unsafe {
+        fgm_attend_q8_heads(
+            out.as_mut_ptr(), q.as_ptr(), kc.as_ptr(), ks.as_ptr(),
+            vc.as_ptr(), vs.as_ptr(), n_heads as i32, kv_heads as i32,
+            head_dim as i32, start as i32, end as i32, scratch.as_mut_ptr(),
+            h0 as i32, h1 as i32, ring as i32, cap as i32,
+        )
+    }
+}
+
+/// Floats of scratch `attend_q8_heads` needs for a cache of `cap` positions.
+pub fn attend_scratch(cap: usize, head_dim: usize) -> usize {
+    // scores, two u8 weight planes, two int32 accumulator sets
+    cap + cap.div_ceil(2) + 2 * head_dim + 64
+}
+
+/// All heads of one query row, sharing each K/V line across every head.
+///
+/// With one KV head this raises arithmetic intensity from 1 MAC/byte to
+/// n_heads, which is the only lever that moves a kernel already sitting at
+/// 3-7% of the VNNI ceiling but at the bandwidth ceiling. Worth it only once
+/// the K set exceeds L2 -- below that the head-outer kernel's four-position
+/// reduction amortisation wins. See `rowbatch_worthwhile`.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn attend_q8_row(
+    out: &mut [f32], q: &[f32], kc: &[i8], ks: &[f32], vc: &[i8], vs: &[f32],
+    n_heads: usize, kv_heads: usize, head_dim: usize, start: usize, end: usize,
+    scratch: &mut [f32], ring: usize, cap: usize,
+) {
+    debug_assert!(scratch.len() >= rowbatch_scratch(n_heads, cap, head_dim));
+    unsafe {
+        fgm_attend_q8_row(
+            out.as_mut_ptr(), q.as_ptr(), kc.as_ptr(), ks.as_ptr(),
+            vc.as_ptr(), vs.as_ptr(), n_heads as i32, kv_heads as i32,
+            head_dim as i32, start as i32, end as i32, scratch.as_mut_ptr(),
+            ring as i32, cap as i32,
+        )
+    }
+}
+
+pub fn rowbatch_scratch(n_heads: usize, cap: usize, head_dim: usize) -> usize {
+    unsafe { fgm_rowbatch_scratch(n_heads as i32, cap as i32, head_dim as i32) as usize }
+}
+
+/// Does head-batching pay at this shape?
+///
+/// The crossover is physical rather than fitted: head-batching wins exactly
+/// when the K working set for one layer exceeds the per-core L2, because below
+/// that the reductions dominate and above it the bandwidth does. Measured
+/// crossovers sit on the 2 MB line -- head_dim 512 at ctx 4096 and head_dim 256
+/// at ctx 8192 are both exactly 2 MB.
+/// Fallback when the cache size cannot be read. 2 MB is the Sapphire Rapids
+/// figure the crossover was originally fitted on.
+pub const L2_PER_CORE_DEFAULT: usize = 2 << 20;
+
+/// Per-core L2, read from sysfs once.
+///
+/// This was a hardcoded 2 MB, which is the Sapphire Rapids number. A Cascade
+/// Lake host has 1 MB, so the rule kept head-outer attention at spans where
+/// head-batching had already won — the crossover is physical, and a physical
+/// constant that does not follow the machine is just a guess that happened to
+/// be right once.
+pub fn l2_per_core() -> usize {
+    use std::sync::OnceLock;
+    static L2: OnceLock<usize> = OnceLock::new();
+    *L2.get_or_init(|| {
+        for i in 0..8 {
+            let base = format!("/sys/devices/system/cpu/cpu0/cache/index{i}");
+            let lvl = std::fs::read_to_string(format!("{base}/level"));
+            let sz = std::fs::read_to_string(format!("{base}/size"));
+            if let (Ok(l), Ok(s)) = (lvl, sz) {
+                if l.trim() != "2" {
+                    continue;
+                }
+                let s = s.trim();
+                let (num, mul) = match s.chars().last() {
+                    Some('K') => (&s[..s.len() - 1], 1 << 10),
+                    Some('M') => (&s[..s.len() - 1], 1 << 20),
+                    _ => (s, 1),
+                };
+                if let Ok(v) = num.parse::<usize>() {
+                    return v * mul;
+                }
+            }
+        }
+        L2_PER_CORE_DEFAULT
+    })
+}
+
+#[inline]
+pub fn rowbatch_worthwhile(kv_heads: usize, head_dim: usize, span: usize) -> bool {
+    kv_heads == 1 && span * head_dim > l2_per_core()
+}
+
+/// Force the scalar P.V weight fill, for A/B against the vectorised one inside
+/// a single measurement window. Comparing across runs does not work here: the
+/// platform's AMX corruption rate drifts run to run and swamps the effect.
+pub fn set_scalar_wfill(on: bool) {
+    unsafe { fgm_set_scalar_wfill(i32::from(on)) }
+}
+
+/// Write one quantised V row into the transposed cache at `slot`.
+#[inline]
+pub fn store_v_t(vt: &mut [i8], src: &[i8], n: usize, slot: usize) {
+    debug_assert!(vt.len() >= (slot / 4 + 1) * n * 4);
+    debug_assert!(src.len() >= n);
+    unsafe { fgm_store_v_t(vt.as_mut_ptr(), src.as_ptr(), n as i32, slot as i32) }
+}
+
+/// Does this platform preserve AMX tile state across a context switch?
+///
+/// Some hypervisors do not: tiles come back zeroed, so any accumulator held in
+/// a tile across a k-loop silently loses everything summed before the switch.
+/// The probe forces the condition with an explicit `nanosleep` rather than
+/// waiting for ambient load, so the answer does not depend on how busy the box
+/// happens to be during warm-up.
+///
+/// Returns the number of corrupted trials out of `trials`. `hold_us` is how
+/// long tile state is held per trial; the probe oversubscribes the machine with
+/// spinner threads for the duration, because a *voluntary* context switch
+/// (nanosleep) does not reproduce the fault — only involuntary preemption does.
+pub fn tile_probe(trials: usize, hold_us: i64) -> usize {
+    unsafe { fgm_tile_probe(trials as i32, hold_us) as usize }
+}
+
+/// Force the in-GEMM corruption guard on or off. The guard costs 1-2%, so it
+/// should only run where [`tile_probe`] found a defect.
+pub fn tile_guard_set(on: bool) {
+    unsafe { fgm_tile_guard_set(i32::from(on)) }
+}
+
+/// Corruptions detected and recovered since the last reset.
+pub fn tile_retries() -> u64 {
+    unsafe { fgm_tile_retry_count() as u64 }
+}
+
+pub fn tile_retries_reset() {
+    unsafe { fgm_tile_retry_reset() }
+}
+
+/// Run the probe and configure the guard accordingly.
+/// `FGM_TILE_GUARD=on|off` overrides the decision.
+///
+/// The stakes are asymmetric: a false positive costs 1-2% throughput, a false
+/// negative means silently wrong answers under load. So detection escalates the
+/// hold time until it either finds corruption or has looked hard enough that a
+/// clean result is trustworthy. Corruption probability rises steeply with hold
+/// time (measured: ~3% at 100 us, 16% at 1 ms, 89% at 10 ms), so the 16 ms stage
+/// is effectively conclusive.
+///
+/// Returns (guard_enabled, corrupted_trials, hold_us_that_found_it).
+pub fn tile_guard_autodetect(trials: usize) -> (bool, usize, i64) {
+    // The probe itself is AMX code. On a VNNI host there is no tile state to
+    // lose and running the probe to find that out would be the SIGILL.
+    if backend() != Backend::Amx {
+        return (false, 0, 0);
+    }
+    match std::env::var("FGM_TILE_GUARD").as_deref() {
+        Ok("on") => {
+            tile_guard_set(true);
+            return (true, 0, 0);
+        }
+        Ok("off") => {
+            tile_guard_set(false);
+            return (false, 0, 0);
+        }
+        _ => {}
+    }
+    for hold_us in [2_000i64, 8_000, 16_000] {
+        let bad = tile_probe(trials, hold_us);
+        if bad > 0 {
+            tile_guard_set(true);
+            return (true, bad, hold_us);
+        }
+    }
+    tile_guard_set(false);
+    (false, 0, 0)
+}
+
+/// Rotate + quantise + tile-pack rows `[r0, r1)` of a GEMM activation.
+///
+/// `r0` must be a multiple of 16 so every stage stays tile-aligned. This is the
+/// per-GEMM preamble that used to run single-threaded while the GEMM itself was
+/// parallel; the pool now splits it by 16-row tile blocks.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub fn prep_rows(
+    src: &[f32], lda: usize, rot: &mut [f32], qa: &mut [i8], qs: &mut [f32],
+    pa: &mut [i8], m: usize, k: usize, hsz: usize, r0: usize, r1: usize,
+) {
+    debug_assert!(r0 % 16 == 0, "prep row start must be tile-aligned");
+    unsafe {
+        fgm_prep_rows(
+            src.as_ptr(), lda as i32, rot.as_mut_ptr(), qa.as_mut_ptr(),
+            qs.as_mut_ptr(), pa.as_mut_ptr(), m as i32, k as i32, hsz as i32,
+            r0 as i32, r1 as i32,
+        )
+    }
+}
+

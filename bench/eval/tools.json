@@ -1,0 +1,86 @@
+[
+  {"name": "get_weather", "desc": "Get the current weather for a location.",
+   "params": [
+     {"name": "city", "type": "STRING", "desc": "City name, e.g. \"Tokyo\"."},
+     {"name": "country", "type": "STRING", "desc": "Two-letter country code, e.g. \"JP\"."},
+     {"name": "unit", "type": "STRING", "enum": ["celsius", "fahrenheit"], "desc": "Temperature unit."},
+     {"name": "days", "type": "INTEGER", "desc": "Number of forecast days."}
+   ]},
+  {"name": "send_email", "desc": "Send an email message.",
+   "params": [
+     {"name": "to", "type": "STRING", "desc": "Recipient address."},
+     {"name": "subject", "type": "STRING", "desc": "Subject line."},
+     {"name": "body", "type": "STRING", "desc": "Message body."},
+     {"name": "priority", "type": "STRING", "enum": ["low", "normal", "high"], "desc": "Delivery priority."}
+   ]},
+  {"name": "create_event", "desc": "Create a calendar event.",
+   "params": [
+     {"name": "title", "type": "STRING", "desc": "Event title."},
+     {"name": "date", "type": "STRING", "desc": "Date as YYYY-MM-DD."},
+     {"name": "start_time", "type": "STRING", "desc": "Start time as HH:MM in 24-hour form."},
+     {"name": "minutes", "type": "INTEGER", "desc": "Duration in minutes."}
+   ]},
+  {"name": "search_flights", "desc": "Search for available flights.",
+   "params": [
+     {"name": "origin", "type": "STRING", "desc": "Origin airport IATA code."},
+     {"name": "destination", "type": "STRING", "desc": "Destination airport IATA code."},
+     {"name": "depart_date", "type": "STRING", "desc": "Departure date as YYYY-MM-DD."},
+     {"name": "passengers", "type": "INTEGER", "desc": "Number of passengers."}
+   ]},
+  {"name": "convert_currency", "desc": "Convert an amount between currencies.",
+   "params": [
+     {"name": "amount", "type": "NUMBER", "desc": "Amount to convert."},
+     {"name": "from_currency", "type": "STRING", "desc": "Source currency code, e.g. \"USD\"."},
+     {"name": "to_currency", "type": "STRING", "desc": "Target currency code, e.g. \"EUR\"."},
+     {"name": "precision", "type": "INTEGER", "desc": "Decimal places in the result."}
+   ]},
+  {"name": "book_hotel", "desc": "Book a hotel room.",
+   "params": [
+     {"name": "city", "type": "STRING", "desc": "City to book in."},
+     {"name": "checkin", "type": "STRING", "desc": "Check-in date as YYYY-MM-DD."},
+     {"name": "nights", "type": "INTEGER", "desc": "Number of nights."},
+     {"name": "guests", "type": "INTEGER", "desc": "Number of guests."}
+   ]},
+  {"name": "translate_text", "desc": "Translate text between languages.",
+   "params": [
+     {"name": "text", "type": "STRING", "desc": "Text to translate."},
+     {"name": "source_lang", "type": "STRING", "desc": "Source language code, e.g. \"en\"."},
+     {"name": "target_lang", "type": "STRING", "desc": "Target language code, e.g. \"fr\"."},
+     {"name": "formal", "type": "BOOLEAN", "desc": "Whether to use a formal register."}
+   ]},
+  {"name": "set_reminder", "desc": "Set a reminder.",
+   "params": [
+     {"name": "message", "type": "STRING", "desc": "Reminder text."},
+     {"name": "date", "type": "STRING", "desc": "Date as YYYY-MM-DD."},
+     {"name": "time", "type": "STRING", "desc": "Time as HH:MM in 24-hour form."},
+     {"name": "repeat", "type": "STRING", "enum": ["none", "daily", "weekly"], "desc": "Repeat interval."}
+   ]},
+  {"name": "query_database", "desc": "Query a table for matching rows.",
+   "params": [
+     {"name": "table", "type": "STRING", "desc": "Table name."},
+     {"name": "column", "type": "STRING", "desc": "Column to filter on."},
+     {"name": "value", "type": "STRING", "desc": "Value to match."},
+     {"name": "limit", "type": "INTEGER", "desc": "Maximum rows to return."}
+   ]},
+  {"name": "play_music", "desc": "Play a music track.",
+   "params": [
+     {"name": "track", "type": "STRING", "desc": "Track title."},
+     {"name": "artist", "type": "STRING", "desc": "Artist name."},
+     {"name": "volume", "type": "INTEGER", "desc": "Volume from 0 to 100."},
+     {"name": "shuffle", "type": "BOOLEAN", "desc": "Whether to shuffle the queue."}
+   ]},
+  {"name": "order_food", "desc": "Place a food order.",
+   "params": [
+     {"name": "restaurant", "type": "STRING", "desc": "Restaurant name."},
+     {"name": "item", "type": "STRING", "desc": "Menu item to order."},
+     {"name": "quantity", "type": "INTEGER", "desc": "How many to order."},
+     {"name": "delivery", "type": "BOOLEAN", "desc": "True for delivery, false for pickup."}
+   ]},
+  {"name": "get_stock_price", "desc": "Look up a stock price.",
+   "params": [
+     {"name": "symbol", "type": "STRING", "desc": "Ticker symbol, e.g. \"GOOG\"."},
+     {"name": "exchange", "type": "STRING", "desc": "Exchange code, e.g. \"NASDAQ\"."},
+     {"name": "currency", "type": "STRING", "desc": "Currency code for the quote."},
+     {"name": "days", "type": "INTEGER", "desc": "Days of history to include."}
+   ]}
+]
