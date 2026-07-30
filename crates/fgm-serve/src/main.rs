@@ -40,6 +40,7 @@ struct Args {
     threads: usize,
     ctx: usize,
     batch: usize,
+    prefix_min: usize,
     no_download: bool,
 }
 
@@ -59,6 +60,10 @@ USAGE
     --ctx N            max context in tokens (default 8192)
     --batch N          concurrent sequences decoded together (default 8).
                        One KV cache is allocated per slot up front.
+    --share-min N      cache and reuse a shared token prefix at least N long
+                       (default 256; 0 disables). Requests that begin with the
+                       same block -- e.g. a common tool declaration -- skip
+                       re-prefilling it.
     --no-download      fail instead of fetching anything
 
 ENDPOINTS
@@ -85,6 +90,7 @@ fn parse_args() -> Args {
         threads: std::thread::available_parallelism().map(|v| v.get()).unwrap_or(4),
         ctx: 8192,
         batch: 8,
+        prefix_min: 256,
         no_download: false,
     };
     let mut it = std::env::args().skip(1);
@@ -97,6 +103,7 @@ fn parse_args() -> Args {
             "--threads" | "-t" => a.threads = next().parse().unwrap_or_else(|_| usage()),
             "--ctx" => a.ctx = next().parse().unwrap_or_else(|_| usage()),
             "--batch" | "-b" => a.batch = next().parse().unwrap_or_else(|_| usage()),
+            "--share-min" => a.prefix_min = next().parse().unwrap_or_else(|_| usage()),
             "--no-download" => a.no_download = true,
             "--help" | "-h" => usage(),
             _ => usage(),
@@ -407,14 +414,20 @@ fn main() {
                     batch: a.batch.max(1),
                     threads: a.threads,
                     prefill_chunk: PREFILL_CHUNK,
+                    prefix_min: a.prefix_min,
                 },
                 jobs_rx,
             );
         });
 
         eprintln!(
-            "fastgemma: listening on http://{}  (POST /v1/completions, batch {})",
-            a.addr, a.batch
+            "fastgemma: listening on http://{}  (POST /v1/completions, batch {}, {})",
+            a.addr, a.batch,
+            if a.prefix_min > 0 {
+                format!("prefix-share >= {} tok", a.prefix_min)
+            } else {
+                "prefix-share off".into()
+            }
         );
         let _ = std::io::stderr().flush();
 

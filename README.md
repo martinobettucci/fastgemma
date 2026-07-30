@@ -104,6 +104,8 @@ curl localhost:8080/v1/completions \
 --ctx N            max context in tokens (default 8192)
 --batch N          sequences decoded together (default 8); one KV cache
                    is allocated per slot up front
+--share-min N      reuse a shared token prefix at least N long across
+                   requests (default 256; 0 disables)
 --no-download      fail instead of fetching anything
 ```
 
@@ -141,6 +143,15 @@ alone.
 Prefill is not batched across sequences — it is compute-bound and already runs
 256 rows per forward — so a request arriving mid-generation stalls the batch for
 the length of its own prefill. That is a TTFT cost, not a throughput one.
+
+**Shared prefixes are prefilled once** (`--share-min`, default 256). When
+consecutive requests begin with the same token block — a common system prompt or
+tool declaration — that block's KV is computed once and forked into every later
+request, which then prefills only its unique suffix. Measured on one server, 8
+requests sharing a 2304-token prefix: prefill **63.8 s vs 205.1 s** without
+(3.2×), reused requests prefilling in ~2.4 s against ~24 s. The reused length is
+floored to a whole prefill chunk so the arithmetic matches a full prefill
+exactly; the generated text is byte-identical with sharing on or off.
 
 These are rejected rather than ignored, because silently downgrading a request
 returns wrong results instead of degraded ones:

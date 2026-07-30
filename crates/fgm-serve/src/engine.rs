@@ -87,6 +87,29 @@ pub struct Config {
     pub batch: usize,
     pub threads: usize,
     pub prefill_chunk: usize,
+    /// Shortest shared token prefix worth caching. 0 disables prefix sharing.
+    pub prefix_min: usize,
+}
+
+/// Length of the longest common leading run of two token sequences.
+fn lcp(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// A prefill result kept so the next request that starts with the same tokens
+/// can fork it instead of recomputing it.
+///
+/// The whole cache is forked as a unit -- `kv.len == toks.len` -- because a
+/// sliding-window layer that has wrapped stores its live positions in ring
+/// order, so an arbitrary sub-prefix of it is not contiguous and cannot be
+/// copied out. That is why reuse requires a job to start with *exactly* these
+/// tokens, and why the template holds the shared prefix itself rather than some
+/// longer prompt it was a prefix of.
+struct Prefix {
+    /// The shared tokens; a job reuses this only if it begins with all of them.
+    toks: Vec<u32>,
+    /// Prefilled to exactly `toks.len()` positions.
+    kv: KvCache,
 }
 
 /// Run until the job channel is closed. Owns everything the forward pass needs,
@@ -113,6 +136,16 @@ pub fn run(model: &Model, tok: &Tokenizer, cfg: Config, rx: Receiver<Job>) {
 
     let mut slots: Vec<Option<Slot>> = (0..cfg.batch).map(|_| None).collect();
 
+    // Prefix sharing. In the target workload every request carries the same
+    // 12-tool declaration block, so its KV is worth computing once and forking.
+    // The template is (re)built lazily: when two consecutive prompts share a
+    // prefix at least `prefix_min` long and nothing already covers it, that
+    // prefix is prefilled once into `tmpl_kv` and reused by every later prompt
+    // that starts with it. `last_toks` remembers the previous prompt so the
+    // shared length can be discovered without the client declaring it.
+    let mut prefix: Option<Prefix> = None;
+    let mut last_toks: Vec<u32> = Vec::new();
+
     loop {
         // ---- admit -------------------------------------------------------
         loop {
@@ -132,9 +165,21 @@ pub fn run(model: &Model, tok: &Tokenizer, cfg: Config, rx: Receiver<Job>) {
                 }
             };
 
+            // Reuse the template when this prompt begins with exactly its
+            // tokens. `<` not `<=`: leave at least one token to forward so the
+            // first logits come from a real step rather than a stale cache row.
+            let reuse = match &prefix {
+                Some(p) if p.toks.len() < job.toks.len()
+                    && job.toks[..p.toks.len()] == p.toks[..] => p.toks.len(),
+                _ => 0,
+            };
+
             caches[i].clear();
             let t0 = std::time::Instant::now();
-            let mut off = 0usize;
+            if reuse > 0 {
+                caches[i].fork_from(&prefix.as_ref().unwrap().kv);
+            }
+            let mut off = reuse;
             let mut first = 0u32;
             while off < job.toks.len() {
                 let n = cfg.prefill_chunk.min(job.toks.len() - off);
@@ -144,12 +189,50 @@ pub fn run(model: &Model, tok: &Tokenizer, cfg: Config, rx: Receiver<Job>) {
                 }
                 off += n;
             }
-            eprintln!(
-                "  slot {i}: prefill {} tok in {:.2}s ({:.1} tok/s)",
-                job.toks.len(),
-                t0.elapsed().as_secs_f64(),
-                job.toks.len() as f64 / t0.elapsed().as_secs_f64().max(1e-9)
-            );
+            let dt = t0.elapsed().as_secs_f64();
+            if reuse > 0 {
+                eprintln!(
+                    "  slot {i}: prefill {} tok ({} shared, {} new) in {:.2}s",
+                    job.toks.len(), reuse, job.toks.len() - reuse, dt
+                );
+            } else {
+                eprintln!(
+                    "  slot {i}: prefill {} tok in {:.2}s ({:.1} tok/s)",
+                    job.toks.len(), dt, job.toks.len() as f64 / dt.max(1e-9)
+                );
+            }
+
+            // (Re)build the template when this prompt and the previous one
+            // share a long enough prefix that the current template does not
+            // already cover. One extra prefill of the shared span, amortised
+            // over every subsequent request that reuses it.
+            if cfg.prefix_min > 0 && reuse == 0 {
+                // Floor the shared length to a whole prefill chunk. A full
+                // prefill groups positions into GEMM calls at [0,C),[C,2C),...;
+                // reusing a template of length T then chunking the suffix from T
+                // only reproduces those exact groupings -- and therefore the
+                // exact int8/int4 reduction order -- when T is a multiple of C.
+                // At a ragged T the boundary chunk has a different row count, the
+                // low-precision sums land a hair apart, and greedy occasionally
+                // flips a token. Aligning T makes reuse bit-identical to a full
+                // prefill rather than merely close.
+                let raw = lcp(&job.toks, &last_toks).min(job.toks.len().saturating_sub(1));
+                let share = raw / cfg.prefill_chunk * cfg.prefill_chunk;
+                let covered = prefix.as_ref().map(|p| p.toks.len()).unwrap_or(0);
+                if share >= cfg.prefix_min && share != covered {
+                    let mut kv = KvCache::new(&mcfg, cfg.ctx, cfg.prefill_chunk);
+                    let mut o = 0usize;
+                    while o < share {
+                        let n = cfg.prefill_chunk.min(share - o);
+                        runner.forward(&job.toks[o..o + n], o, &mut kv);
+                        o += n;
+                    }
+                    prefix = Some(Prefix { toks: job.toks[..share].to_vec(), kv });
+                    eprintln!("  prefix cache: built {share}-token shared prefix");
+                }
+            }
+            last_toks = job.toks.clone();
+
             let pos = job.toks.len();
             slots[i] = Some(Slot {
                 job,

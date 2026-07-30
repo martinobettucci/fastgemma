@@ -112,6 +112,13 @@ Prefill uses int8 weights (selected automatically at ≥16 rows), decode int4.
 | TTFT | first 70.1 s, last 342.1 s |
 | KV cache | **332 MB total**, 41.4 MB/seq at 10248 context |
 
+The server (`fgm-serve`) prefills a shared prefix once and forks it into every
+request that begins with it, so a 2048-token shared tool block is not recomputed
+eight times. Measured on the AVX-512 host, 8 requests sharing a 2304-token
+prefix: prefill 63.8 s with sharing vs 205.1 s without (3.2×), and the generated
+text is byte-identical either way — the reused length is floored to a whole
+prefill chunk so its arithmetic matches a full prefill exactly.
+
 Decode is measured over 352 steps and extrapolated to 2048; the rate is
 measured, the total is arithmetic.
 

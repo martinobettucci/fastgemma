@@ -2207,3 +2207,55 @@ message per slot per step. Arithmetic puts all of that under a second across
 the whole run, against a 40 s difference — so it does not explain the gap and
 the gap is not distinguishable from noise anyway. Not optimising something that
 has not been measured to matter.
+
+---
+
+## 35. Prefix sharing in the server, and why a cached prefix must be chunk-aligned
+
+Wired prefix sharing into `fgm-serve`: it keeps a template KV for the token
+prefix that consecutive requests share, forks it into each new slot, and
+prefills only the divergent suffix. No client configuration — the shared length
+is discovered from the previous prompt (`--share-min`, default 256).
+
+Measured, one server, 8 requests sharing a 2304-token prefix:
+
+    prefill wall   off 205.1s   on 63.8s   (3.2x)
+    reused slot    ~2.4s        vs ~24s full   (~10x)
+
+### The bug that only greedy decoding reveals
+
+First cut used the raw longest-common-prefix length as the template size. The
+mechanism was proven correct — the bench `share` mode asserts next-token
+bit-identity after fork and passes 4/4 — yet the server's outputs diverged from
+the no-sharing baseline on 2–3 of 8 requests.
+
+The chase went through the wrong suspects first. `FGM_ZERO=all` (zero every
+scratch buffer) did **not** fix it, ruling out the engine's known
+read-before-write non-determinism. Same prompt three times sequentially was
+identical, ruling out ambient noise. The tell was that the bench's fork check
+passed while the server's did not, and the only structural difference was the
+chunking:
+
+- A full prefill groups positions into GEMM calls at `[0,256), [256,512), …`.
+- Reusing a template of length `T` then chunking the suffix from `T` reproduces
+  those exact groupings **only when `T` is a multiple of the chunk.** At a
+  ragged `T` (503, say) the boundary chunk has a different row count, the
+  int8/int4 reduction lands a hair apart, and greedy flips a token.
+
+The bench passed because its two arms used identical chunk boundaries by
+construction. The fix is one line — floor the shared length to a whole prefill
+chunk — after which prefill is bit-identical to a full prefill, and every one of
+8 requests generates byte-identical text with sharing on or off, at both
+`max_tokens=1` (isolating prefill) and `max_tokens=16` (full generation).
+
+**Trap 29 — a cache is only transparent if it reproduces the exact arithmetic,
+not the exact math.** Prefix caching is mathematically a no-op: the same
+positions attend to the same keys. But in a low-precision engine "same result"
+requires the same *reduction order*, and reduction order is set by how prefill
+is chunked. Cache the prefix at a boundary the fresh path won't reproduce and
+the cache stops being transparent — silently, and only on the tokens that sit on
+a greedy knife-edge. The correctness test that catches it is byte-identity of
+the generated text, on vs off; next-token-after-fork alone (the bench check) is
+necessary but passed straight over this.
+
+(All of the above on the AVX-512 backend — still no AMX on this host.)
